@@ -1,8 +1,8 @@
 # marksman-cam
 
-Turns a Canon EOS/PowerShot connected over USB into a webcam on **Linux** and **Windows 11**. No Canon software, no EDSDK, no account or subscription: every feature is always on.
+Turns a Canon EOS/PowerShot, or a Sony Alpha in PC Remote mode, connected over USB into a webcam on **Linux** and **Windows 11**. No vendor software, SDK, account or subscription: every feature is always on.
 
-Not affiliated with or endorsed by Canon Inc. Canon, EOS, PowerShot and Rebel are trademarks of Canon Inc.
+Not affiliated with or endorsed by Canon Inc. or Sony Group Corporation. Canon, EOS, PowerShot and Rebel are trademarks of Canon Inc.; Sony and Alpha are trademarks of Sony Group Corporation.
 
 ```
 camera ──USB PTP (libusb)──► live-view JPEG ──libjpeg-turbo──► crop/rotate/mirror/fit/fill,
@@ -21,10 +21,10 @@ marksman-cam [-d DEV] [-s 1920x1080] [-r 30] [--fill] [--rotate 90] [--mirror] [
           [--set iso=0x48] [--set kelvin=5200] ...
 ```
 - Start it and leave it running. It reconnects when the camera is unplugged, switched off, or restarted, and shows a grey frame while there is no camera.
-- `--set` values are Canon raw property codes. Examples: iso `0x48`=100, `0x50`=200, `0x58`=400, `0x60`=800, `0x68`=1600, `0x00`=auto. Kelvin is plain Kelvin.
+- `--set` values are Canon raw property codes (Canon only for now). Examples: iso `0x48`=100, `0x50`=200, `0x58`=400, `0x60`=800, `0x68`=1600, `0x00`=auto. Kelvin is plain Kelvin.
 - On Windows the app using the camera picks 640x360, 1280x720 or 1920x1080, and marksman-cam renders at that size.
 
-Tested on an EOS Rebel T5i / 700D under Windows 11. Live view is 960x640.
+Tested under Windows 11 on an EOS Rebel T5i / 700D (live view 960x640) and a Sony a6400 in PC Remote mode (live view 1024x576 at a steady 20 fps over USB, through the stock Windows driver).
 
 | Mode | fps | Notes |
 |---|---|---|
@@ -38,8 +38,9 @@ Live view over USB is the limit: above 20 fps on this body you need HDMI out int
 
 Camera prep:
 - Turn auto power-off off.
-- Use a shooting mode, Movie mode where available.
-- Close any other program using the camera (gphoto2, Canon's software). Only one program can own it.
+- Canon: use a shooting mode, Movie mode where available.
+- Sony (e.g. a6400): MENU > Setup > **USB Connection: PC Remote** (not Mass Storage/MTP). Any shooting mode.
+- Close any other program using the camera (gphoto2, Canon or Sony software). Only one program can own it.
 
 ## Linux (Arch)
 ```sh
@@ -53,7 +54,7 @@ echo 'options v4l2loopback video_nr=10 card_label="Marksman Cam" exclusive_caps=
 sudo modprobe v4l2loopback
 
 # let your user open the camera without root
-echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="04a9", TAG+="uaccess"' | sudo tee /etc/udev/rules.d/70-marksman-cam.rules
+printf 'SUBSYSTEM=="usb", ATTR{idVendor}=="%s", TAG+="uaccess"\n' 04a9 054c | sudo tee /etc/udev/rules.d/70-marksman-cam.rules
 sudo udevadm control --reload && sudo udevadm trigger
 
 marksman-cam            # then pick "Marksman Cam" in your app; check with: ffplay /dev/video10
@@ -62,7 +63,7 @@ marksman-cam            # then pick "Marksman Cam" in your app; check with: ffpl
 - Secure Boot: sign the v4l2loopback DKMS module, or it will not load.
 - Run on login with a user service, `~/.config/systemd/user/marksman-cam.service`:
   `[Service]` with `ExecStart=/usr/local/bin/marksman-cam` and `Restart=always`. Then `systemctl --user enable --now marksman-cam`.
-- Several cameras: run more instances on `/dev/video11` and up (`v4l2loopback devices=2 video_nr=10,11`). Each instance opens the first free Canon device.
+- Several cameras: run more instances on `/dev/video11` and up (`v4l2loopback devices=2 video_nr=10,11`). Each instance opens the first free supported camera.
 - Other distros need the same packages: Debian/Ubuntu `libusb-1.0-0-dev libturbojpeg0-dev v4l2loopback-dkms`; Fedora `libusb1-devel turbojpeg-devel` plus `akmod-v4l2loopback` from RPM Fusion.
 
 ## Windows 11
@@ -97,13 +98,13 @@ Requires build 22000 or newer, which has `MFCreateVirtualCamera`.
 4. **Check:** `vcam_probe.exe` (in `build\`) opens "Marksman Cam" like an app and reads 90 frames. It reports:
    - fallback-grey frames (flicker);
    - delivered fps and distinct-picture fps;
-   - the first frame's luma: **57** = no Canon found (marksman-cam's grey), **48** = nothing is feeding the DLL (service not running), anything else = a live picture.
+   - the first frame's luma: **57** = no camera found (marksman-cam's grey), **48** = nothing is feeding the DLL (service not running), anything else = a live picture.
 5. **Without installing** (development): run `build\marksman-cam.exe` as a normal user. It creates a temporary "Marksman Cam" that disappears when it exits. The DLL must have been registered once (by `--install`, or `regsvr32`).
 
 ## Layout
 | File | What |
 |---|---|
-| `src/ptp.c` | PTP over USB bulk plus Canon EOS live view (open session, remote mode, EVF output to PC, GetViewFinderData, keep-alive, properties) |
+| `src/ptp.c` | PTP over USB bulk, plus Canon EOS live view (remote mode, EVF output to PC, GetViewFinderData, keep-alive, properties) and Sony PC Remote live view (SDIO connect, live-view object 0xFFFFC002, property-poll keep-alive) |
 | `src/ptp_wpd.cpp` | Windows transport: the same PTP operations through the stock MTP driver |
 | `src/image.c` | JPEG decode, geometry (crop, rotate, mirror, fit/fill, bilinear scaling), picture controls, YUYV/NV12 |
 | `src/sink_v4l2.c` | Linux output |

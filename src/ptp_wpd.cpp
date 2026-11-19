@@ -172,7 +172,9 @@ extern "C" ptp_t *wpd_open(void)
         FAILED(mgr->GetDevices(ids, &n)))
         n = 0;
     for (DWORD i = 0; i < n; i++) {
-        if (!p && _wcsnicmp(ids[i], L"\\\\?\\usb#vid_04a9&", 17) == 0) {
+        int sony = _wcsnicmp(ids[i], L"\\\\?\\usb#vid_054c&", 17) == 0;
+        int canon = _wcsnicmp(ids[i], L"\\\\?\\usb#vid_04a9&", 17) == 0;
+        if (!p && ((sony && eos_only_vid != 0x04A9) || (canon && eos_only_vid != 0x054C))) {
             IPortableDeviceValues *client = values();
             IPortableDevice *dev = nullptr;
             if (client) {
@@ -190,6 +192,7 @@ extern "C" ptp_t *wpd_open(void)
                 p->ctx = dev;
                 p->op = wpd_op;
                 p->release = wpd_release;
+                p->sony = sony;
             } else {
                 if (p)
                     free(p);

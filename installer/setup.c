@@ -79,7 +79,7 @@ static int install(void)
 
     if (MessageBoxW(NULL,
                     L"Install Marksman Cam?\n\nThis adds an \"Marksman Cam\" camera for all apps and a background "
-                    L"service that wakes your Canon camera only while an app uses it.\n\nIf it is already "
+                    L"service that wakes your camera only while an app uses it.\n\nIf it is already "
                     L"installed, this upgrades it.",
                     TITLE, MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
         return 1;
@@ -120,8 +120,8 @@ static int install(void)
         RegCloseKey(k);
     }
     MessageBoxW(NULL,
-                L"Marksman Cam is installed.\n\nPlug in your Canon camera (shooting or Movie mode, auto power-off "
-                L"disabled) and pick \"Marksman Cam\" in any app.\n\nTo remove it: Settings > Apps > Installed apps.",
+                L"Marksman Cam is installed.\n\nPlug in your camera (Canon: shooting or Movie mode; Sony: USB "
+                L"Connection set to PC Remote; auto power-off disabled) and pick \"Marksman Cam\" in any app.\n\nTo remove it: Settings > Apps > Installed apps.",
                 TITLE, MB_OK | MB_ICONINFORMATION);
     return 0;
 }

@@ -9,7 +9,7 @@
 #include "../src/ptp.h"
 
 /* Fake bulk endpoints: IN transfers are scripted, OUT transfers are logged. */
-static uint8_t script[8][2048], sent[512];
+static uint8_t script[16][2048], sent[512];
 static int script_len[8], nscript, next_in, nsent;
 
 static int fake_bulk(void *ctx, uint8_t ep, uint8_t *buf, int len, int *got, unsigned timeout_ms)
@@ -81,6 +81,23 @@ static void test_ptp(void)
     free(p.buf);
 
     assert(eos_setting("iso") == 0xD103 && eos_setting("nope") == -1);
+
+    /* Sony: GetObject(0xFFFFC002) returns [u32 offset][u32 size] then the JPEG. */
+    ptp_t s = {.bulk = fake_bulk, .ep_in = 0x81, .ep_out = 0x02, .buf = malloc(PTP_BUF), .sony = 1};
+    uint8_t sv[20] = {0};
+    put32(sv, 16), put32(sv + 4, 4);
+    sv[16] = 0xFF, sv[17] = 0xD8, sv[18] = 0xFF, sv[19] = 0xD9;
+    nsent = 0;
+    push_container(2, 0x1009, sv, 20, 0);
+    push_container(3, 0x2001, NULL, 0, 0);
+    assert(eos_frame(&s, &jpeg, &len) == 1 && len == 4 && jpeg == s.buf + 12 + 16);
+    assert(sent[6] == 0x09 && sent[7] == 0x10 && sent[12] == 0x02 && sent[13] == 0xC0 && sent[15] == 0xFF);
+    push_container(3, 0x200F, NULL, 0, 0); /* live view not up yet */
+    assert(eos_frame(&s, &jpeg, &len) == 0);
+    assert(eos_set_prop(&s, 0xD21E, 1) == 0x2005);
+    assert(sony_find_jpeg(sv + 16, 4, &len) == sv + 16 && len == 4); /* no header: SOI..EOI scan */
+    assert(!sony_find_jpeg(sv, 16, &len));
+    free(s.buf);
 }
 
 static uint8_t *px(uint8_t *img, int w, int x, int y) { return img + ((size_t)y * w + x) * 4; }

@@ -1,4 +1,4 @@
-/* marksman-cam: Canon EOS live view -> virtual webcam. */
+/* marksman-cam: Canon EOS / Sony Alpha live view -> virtual webcam. */
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -51,6 +51,7 @@ static const char usage[] =
     "  --hue DEG\n"
     "  --set NAME=VALUE  camera property once connected; NAME is av tv iso ec wb kelvin style or a hex\n"
     "                    property code; VALUE is the Canon raw code (iso 0x48=100 .. 0x70=3200), kelvin in K\n"
+    "  --camera canon|sony  use only that make when several cameras are plugged in (put it first)\n"
     "  --snapshot FILE   save one live-view JPEG and exit (camera check, no virtual camera needed)\n"
 #ifdef _WIN32
     "  --install [opts]  (admin) permanent \"Marksman Cam\" + background service; opts become its settings\n"
@@ -76,7 +77,7 @@ static int snapshot(const char *path)
     FILE *f;
 
     if (!cam) {
-        fprintf(stderr, "marksman-cam: no Canon camera found\n");
+        fprintf(stderr, "marksman-cam: no camera found (Canon EOS/PowerShot, or Sony in PC Remote mode)\n");
         return 1;
     }
     if ((rc = eos_start_liveview(cam)) != PTP_OK) {
@@ -169,7 +170,7 @@ static void *capture(void *arg)
         int rc;
         if (!cam) {
             if (!waiting_said++)
-                fprintf(stderr, "marksman-cam: an app wants the webcam; waiting for a Canon camera on USB\n");
+                fprintf(stderr, "marksman-cam: an app wants the webcam; waiting for a camera on USB\n");
             sleep_s(2);
             continue;
         }
@@ -345,7 +346,14 @@ int main(int argc, char **argv)
             v.hue = atoi(val);
         else if (!strcmp(a, "--set") && nsets < MAX_SETS && strchr(val, '='))
             sets[nsets++] = val;
-        else if (!strcmp(a, "--snapshot"))
+        else if (!strcmp(a, "--camera")) {
+            if (!strcmp(val, "canon"))
+                eos_only_vid = 0x04A9;
+            else if (!strcmp(val, "sony"))
+                eos_only_vid = 0x054C;
+            else
+                goto bad;
+        } else if (!strcmp(a, "--snapshot"))
             return snapshot(val);
         else
             goto bad;

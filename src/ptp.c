@@ -6,6 +6,7 @@
 #include <string.h>
 
 #define CANON_VID  0x04A9
+#define SONY_VID   0x054C
 #define TIMEOUT_MS 5000
 #define ALIGN      1024u /* keeps every bulk read a multiple of the max packet size (HS 512, SS 1024) */
 
@@ -13,13 +14,20 @@ enum { CMD = 1, DATA = 2, RESP = 3 };
 
 #define OP_OPEN_SESSION     0x1002
 #define OP_CLOSE_SESSION    0x1003
+#define OP_GET_OBJECT       0x1009
 #define OP_EOS_SET_PROP     0x9110
 #define OP_EOS_REMOTE_MODE  0x9114
 #define OP_EOS_EVENT_MODE   0x9115
 #define OP_EOS_GET_EVENT    0x9116
 #define OP_EOS_KEEP_ON      0x911D
 #define OP_EOS_VIEWFINDER   0x9153
+#define OP_SONY_CONNECT     0x9201 /* SDIO connect, phases 1..3 */
+#define OP_SONY_EXT_INFO    0x9202 /* param: protocol version, 0x12C = 3.00, 0xC8 = 2.00 */
+#define OP_SONY_ALL_PROPS   0x9209
+#define SONY_LIVEVIEW       0xFFFFC002 /* object handle of the current live-view frame */
 
+#define RC_UNSUPPORTED      0x2005
+#define RC_ACCESS_DENIED    0x200F
 #define RC_BUSY             0x2019
 #define RC_SESSION_OPEN     0x201E
 #define RC_NOT_READY        0xA102
@@ -112,6 +120,8 @@ int ptp_transact(ptp_t *p, uint16_t code, const uint32_t *params, int nparams,
 int eos_set_prop(ptp_t *p, uint32_t prop, uint32_t value)
 {
     uint8_t d[12];
+    if (p->sony)
+        return RC_UNSUPPORTED; /* ponytail: Sony --set needs per-property value sizes (0x9205); add with a use for it */
     wr32(d, 12);
     wr32(d + 4, prop);
     wr32(d + 8, value);
@@ -125,6 +135,25 @@ static int get_event(ptp_t *p)
     return ptp_transact(p, OP_EOS_GET_EVENT, NULL, 0, NULL, 0, &d, &n);
 }
 
+/* Sony PC Remote handshake. Live view then runs on its own; frames are read as an object. */
+static int sony_start(ptp_t *p)
+{
+    uint32_t a[3] = {1, 0, 0}, ver = 0x12C;
+    const uint8_t *d;
+    uint32_t n;
+    int rc;
+    for (a[0] = 1; a[0] <= 2; a[0]++)
+        if ((rc = ptp_transact(p, OP_SONY_CONNECT, a, 3, NULL, 0, &d, &n)) != PTP_OK)
+            return rc;
+    if ((rc = ptp_transact(p, OP_SONY_EXT_INFO, &ver, 1, NULL, 0, &d, &n)) != PTP_OK) {
+        ver = 0xC8; /* older bodies only speak 2.00 */
+        if ((rc = ptp_transact(p, OP_SONY_EXT_INFO, &ver, 1, NULL, 0, &d, &n)) != PTP_OK)
+            return rc;
+    }
+    a[0] = 3;
+    return ptp_transact(p, OP_SONY_CONNECT, a, 3, NULL, 0, &d, &n);
+}
+
 int eos_start_liveview(ptp_t *p)
 {
     const uint32_t one = 1;
@@ -132,6 +161,8 @@ int eos_start_liveview(ptp_t *p)
                    : ptp_transact(p, OP_OPEN_SESSION, &one, 1, NULL, 0, NULL, NULL);
     if (rc != PTP_OK && rc != RC_SESSION_OPEN)
         return rc;
+    if (p->sony)
+        return sony_start(p);
     if ((rc = ptp_transact(p, OP_EOS_REMOTE_MODE, &one, 1, NULL, 0, NULL, NULL)) != PTP_OK)
         return rc;
     if ((rc = ptp_transact(p, OP_EOS_EVENT_MODE, &one, 1, NULL, 0, NULL, NULL)) != PTP_OK)
@@ -144,6 +175,11 @@ int eos_start_liveview(ptp_t *p)
 
 int eos_poll(ptp_t *p)
 {
+    if (p->sony) { /* reading the property block is Sony's keep-alive and connection check */
+        const uint8_t *d;
+        uint32_t n;
+        return ptp_transact(p, OP_SONY_ALL_PROPS, NULL, 0, NULL, 0, &d, &n);
+    }
     int rc = get_event(p);
     if (rc < 0)
         return rc;
@@ -173,17 +209,42 @@ const uint8_t *eos_find_jpeg(const uint8_t *d, uint32_t n, uint32_t *jlen)
     return NULL;
 }
 
+/* Sony live-view object: [u32 JPEG offset][u32 JPEG size] ... JPEG. If that header doesn't check out,
+   falls back to the first SOI through the last EOI. */
+const uint8_t *sony_find_jpeg(const uint8_t *d, uint32_t n, uint32_t *jlen)
+{
+    if (n >= 8) {
+        uint32_t off = rd32(d), len = rd32(d + 4);
+        if (off >= 8 && off < n && len >= 4 && len <= n - off && d[off] == 0xFF && d[off + 1] == 0xD8) {
+            *jlen = len;
+            return d + off;
+        }
+    }
+    for (uint32_t i = 0; i + 1 < n; i++)
+        if (d[i] == 0xFF && d[i + 1] == 0xD8) {
+            uint32_t e = n;
+            while (e >= i + 4 && !(d[e - 2] == 0xFF && d[e - 1] == 0xD9))
+                e--;
+            if (e < i + 4)
+                return NULL;
+            *jlen = e - i;
+            return d + i;
+        }
+    return NULL;
+}
+
 int eos_frame(ptp_t *p, const uint8_t **jpeg, uint32_t *jlen)
 {
-    static const uint32_t args[3] = {0x00100000, 0, 0};
+    static const uint32_t args[3] = {0x00100000, 0, 0}, sony_lv = SONY_LIVEVIEW;
     const uint8_t *d;
     uint32_t n;
-    int rc = ptp_transact(p, OP_EOS_VIEWFINDER, args, 3, NULL, 0, &d, &n);
-    if (rc == RC_NOT_READY || rc == RC_BUSY)
+    int rc = p->sony ? ptp_transact(p, OP_GET_OBJECT, &sony_lv, 1, NULL, 0, &d, &n)
+                     : ptp_transact(p, OP_EOS_VIEWFINDER, args, 3, NULL, 0, &d, &n);
+    if (rc == RC_NOT_READY || rc == RC_BUSY || rc == RC_ACCESS_DENIED) /* Sony: denied until live view is up */
         return 0;
     if (rc != PTP_OK)
         return -1;
-    return (*jpeg = eos_find_jpeg(d, n, jlen)) != NULL;
+    return (*jpeg = p->sony ? sony_find_jpeg(d, n, jlen) : eos_find_jpeg(d, n, jlen)) != NULL;
 }
 
 long eos_setting(const char *name)
@@ -203,6 +264,7 @@ static int usb_bulk(void *ctx, uint8_t ep, uint8_t *buf, int len, int *got, unsi
     return libusb_bulk_transfer(ctx, ep, buf, len, got, timeout_ms);
 }
 
+uint16_t eos_only_vid;
 static libusb_context *usb;
 
 static void report(const char *what, int err)
@@ -217,7 +279,7 @@ static void report(const char *what, int err)
 #endif
     fprintf(stderr, "marksman-cam: %s: %s\n", what, libusb_strerror(err));
     if (err == LIBUSB_ERROR_BUSY || err == LIBUSB_ERROR_ACCESS)
-        fprintf(stderr, "marksman-cam: camera held by another program (gvfs, gphoto2, Canon software) or no permission (see README)\n");
+        fprintf(stderr, "marksman-cam: camera held by another program (gvfs, gphoto2, camera maker software) or no permission (see README)\n");
 }
 
 static ptp_t *try_device(libusb_device *dev)
@@ -228,8 +290,9 @@ static ptp_t *try_device(libusb_device *dev)
     ptp_t *p = NULL;
     int err;
 
-    if (libusb_get_device_descriptor(dev, &dd) || dd.idVendor != CANON_VID)
-        return NULL;
+    if (libusb_get_device_descriptor(dev, &dd) || (dd.idVendor != CANON_VID && dd.idVendor != SONY_VID) ||
+        (eos_only_vid && dd.idVendor != eos_only_vid))
+        return NULL; /* a Sony in Mass Storage/MTP mode has no image-class interface and is skipped below */
     if (libusb_get_active_config_descriptor(dev, &cfg))
         return NULL;
     for (int i = 0; i < cfg->bNumInterfaces && !p; i++) {
@@ -268,6 +331,7 @@ static ptp_t *try_device(libusb_device *dev)
         p->ctx = h;
         p->ep_in = in;
         p->ep_out = out;
+        p->sony = dd.idVendor == SONY_VID;
     }
     libusb_free_config_descriptor(cfg);
     return p;
@@ -296,8 +360,10 @@ void eos_close(ptp_t *p)
 {
     const uint32_t zero = 0;
     if (!p->dead) {
-        eos_set_prop(p, PROP_EVF_OUTPUT, EVF_OFF);
-        ptp_transact(p, OP_EOS_REMOTE_MODE, &zero, 1, NULL, 0, NULL, NULL);
+        if (!p->sony) {
+            eos_set_prop(p, PROP_EVF_OUTPUT, EVF_OFF);
+            ptp_transact(p, OP_EOS_REMOTE_MODE, &zero, 1, NULL, 0, NULL, NULL);
+        }
         if (!p->op)
             ptp_transact(p, OP_CLOSE_SESSION, NULL, 0, NULL, 0, NULL, NULL);
     }

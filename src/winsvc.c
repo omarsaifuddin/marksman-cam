@@ -1,5 +1,5 @@
 /* Windows install mode: a permanent all-users "Marksman Cam" camera plus a background service that wakes the
-   Canon only while some app is reading the camera. */
+   camera only while some app is reading the camera. */
 #include <windows.h>
 #include <signal.h>
 #include <stdio.h>
@@ -91,7 +91,7 @@ int winsvc_install(int argc, char **argv)
                              NULL, NULL, NULL);
     if (!svc)
         return fail("creating the service", GetLastError());
-    SERVICE_DESCRIPTIONW desc = {L"Canon EOS live view as the \"Marksman Cam\" camera. Wakes the camera only while an app uses it."};
+    SERVICE_DESCRIPTIONW desc = {L"Camera live view as the \"Marksman Cam\" camera. Wakes the camera only while an app uses it."};
     ChangeServiceConfig2W(svc, SERVICE_CONFIG_DESCRIPTION, &desc);
     SC_ACTION restart[3] = {{SC_ACTION_RESTART, 5000}, {SC_ACTION_RESTART, 5000}, {SC_ACTION_RESTART, 30000}};
     SERVICE_FAILURE_ACTIONSW actions = {86400, NULL, NULL, 3, restart};
