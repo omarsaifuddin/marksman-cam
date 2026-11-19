@@ -1,0 +1,62 @@
+cmake_minimum_required(VERSION 3.16)
+project(marksman-cam C CXX)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+add_compile_options(-Wall -Wextra)
+
+find_package(PkgConfig REQUIRED)
+find_package(Threads REQUIRED)
+pkg_check_modules(DEPS REQUIRED libusb-1.0 libturbojpeg)
+
+add_library(camcore STATIC src/ptp.c src/image.c)
+target_include_directories(camcore PUBLIC ${DEPS_INCLUDE_DIRS})
+if(WIN32)
+  target_sources(camcore PRIVATE src/ptp_wpd.cpp)
+  target_link_libraries(camcore PUBLIC ole32 uuid)
+  # Fully static: nothing here may depend on the MSYS2 runtime DLLs.
+  target_link_libraries(camcore PUBLIC ${DEPS_STATIC_LIBRARIES})
+  target_link_directories(camcore PUBLIC ${DEPS_STATIC_LIBRARY_DIRS})
+else()
+  target_link_libraries(camcore PUBLIC ${DEPS_LINK_LIBRARIES} m)
+endif()
+
+if(WIN32)
+  add_executable(marksman-cam src/main.c src/sink_mfvcam.c src/winsvc.c)
+  target_link_libraries(marksman-cam camcore Threads::Threads mfplat mfuuid ole32 advapi32)
+  target_link_options(marksman-cam PRIVATE -static)
+
+  add_library(marksman-cam-vcam SHARED win/vcam_source.cpp win/vcam_source.def)
+  set_target_properties(marksman-cam-vcam PROPERTIES PREFIX "")
+  target_link_libraries(marksman-cam-vcam mfplat mfuuid ole32 advapi32 uuid)
+  target_link_options(marksman-cam-vcam PRIVATE -static -static-libgcc -static-libstdc++)
+  install(TARGETS marksman-cam marksman-cam-vcam RUNTIME DESTINATION .)
+
+  # Double-click installer (no console): embeds the two binaries above and runs --install.
+  configure_file(installer/setup.rc.in setup.rc @ONLY)
+  set_source_files_properties(${CMAKE_BINARY_DIR}/setup.rc PROPERTIES OBJECT_DEPENDS
+    "${CMAKE_BINARY_DIR}/marksman-cam.exe;${CMAKE_BINARY_DIR}/marksman-cam-vcam.dll;${CMAKE_SOURCE_DIR}/installer/setup.manifest")
+  add_executable(marksman-cam-setup WIN32 installer/setup.c ${CMAKE_BINARY_DIR}/setup.rc)
+  add_dependencies(marksman-cam-setup marksman-cam marksman-cam-vcam)
+  target_link_libraries(marksman-cam-setup advapi32)
+  target_link_options(marksman-cam-setup PRIVATE -static)
+
+  add_executable(vcam_probe test/vcam_probe.c)
+  target_link_libraries(vcam_probe mfplat mf mfreadwrite mfuuid ole32)
+  target_link_options(vcam_probe PRIVATE -static)
+else()
+  add_executable(marksman-cam src/main.c src/sink_v4l2.c)
+  target_link_libraries(marksman-cam camcore Threads::Threads)
+  install(TARGETS marksman-cam RUNTIME DESTINATION bin)
+endif()
+
+enable_testing()
+add_executable(test_core test/test_core.c)
+target_link_libraries(test_core camcore)
+if(WIN32)
+  target_link_options(test_core PRIVATE -static)
+endif()
+add_test(NAME core COMMAND test_core)
