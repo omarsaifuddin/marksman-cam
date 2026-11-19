@@ -6,7 +6,11 @@
 #include <stdlib.h>
 
 #include "../win/mcam_shm.h"
+#include "ptp.h"
 #include "sink.h"
+
+/* --camera picks the slot: its own virtual camera, CLSID and frame section. */
+static int slot(void) { return mcam_slot_for(eos_only_vid); }
 
 /* IMFVirtualCamera (mfvirtualcamera.h, Windows 11 SDK) is missing from MinGW. It extends IMFAttributes;
    only the prefix of the vtable we call is declared, in SDK order. */
@@ -39,13 +43,13 @@ struct sink {
     ULONGLONG last_request_ms;
 };
 
-static HRESULT create_vcam(const char *name, int lifetime, int access, IMFVirtualCamera **out)
+static HRESULT create_vcam(const char *name, int s, int lifetime, int access, IMFVirtualCamera **out)
 {
     wchar_t wname[128];
     create_vcam_fn create;
     HMODULE m;
 
-    MultiByteToWideChar(CP_UTF8, 0, name ? name : "Marksman Cam", -1, wname, 128);
+    MultiByteToWideChar(CP_UTF8, 0, name ? name : mcam_name[s], -1, wname, 128);
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
     MFStartup(MF_VERSION, MFSTARTUP_LITE);
     if (!(m = LoadLibraryW(L"mfsensorgroup.dll")) ||
@@ -53,13 +57,13 @@ static HRESULT create_vcam(const char *name, int lifetime, int access, IMFVirtua
         fprintf(stderr, "marksman-cam: MFCreateVirtualCamera not available (needs Windows 11)\n");
         return E_NOTIMPL;
     }
-    return create(SOFTWARE_CAMERA_SOURCE, lifetime, access, wname, MCAM_SOURCE_CLSID_STR, NULL, 0, out);
+    return create(SOFTWARE_CAMERA_SOURCE, lifetime, access, wname, mcam_clsid_str[s], NULL, 0, out);
 }
 
-long vcam_install(const char *name)
+long vcam_install(int s)
 {
     IMFVirtualCamera *vcam;
-    HRESULT hr = create_vcam(name, LIFETIME_SYSTEM, ACCESS_ALL_USERS, &vcam);
+    HRESULT hr = create_vcam(NULL, s, LIFETIME_SYSTEM, ACCESS_ALL_USERS, &vcam);
     if (SUCCEEDED(hr)) {
         hr = vcam->lpVtbl->Start(vcam, NULL);
         vcam->lpVtbl->base.Release((IMFAttributes *)vcam); /* system lifetime: it stays registered */
@@ -67,10 +71,10 @@ long vcam_install(const char *name)
     return hr;
 }
 
-long vcam_uninstall(const char *name)
+long vcam_uninstall(int s)
 {
     IMFVirtualCamera *vcam;
-    HRESULT hr = create_vcam(name, LIFETIME_SYSTEM, ACCESS_ALL_USERS, &vcam); /* same identity = same camera */
+    HRESULT hr = create_vcam(NULL, s, LIFETIME_SYSTEM, ACCESS_ALL_USERS, &vcam); /* same identity = same camera */
     if (SUCCEEDED(hr)) {
         hr = vcam->lpVtbl->Remove(vcam);
         vcam->lpVtbl->base.Release((IMFAttributes *)vcam);
@@ -85,7 +89,7 @@ sink_t *sink_open_shared(int w, int h)
         return NULL;
     s->w = w;
     s->h = h;
-    s->shm = mcam_shm_open(&s->map); /* may only succeed once the Frame Server has created it */
+    s->shm = mcam_shm_open(&s->map, slot()); /* may only succeed once the Frame Server has created it */
     return s;
 }
 
@@ -98,7 +102,7 @@ sink_t *sink_open(const char *device, int w, int h, int fps)
     if (!s)
         return NULL;
     /* Session lifetime: Windows removes the camera when this process exits, even on a crash. */
-    hr = create_vcam(device, LIFETIME_SESSION, ACCESS_CURRENT_USER, &s->vcam);
+    hr = create_vcam(device, slot(), LIFETIME_SESSION, ACCESS_CURRENT_USER, &s->vcam);
     if (SUCCEEDED(hr) && FAILED(hr = s->vcam->lpVtbl->Start(s->vcam, NULL)))
         fprintf(stderr, "marksman-cam: virtual camera Start failed 0x%08lx\n", (unsigned long)hr);
     if (FAILED(hr)) {
@@ -113,7 +117,7 @@ sink_t *sink_open(const char *device, int w, int h, int fps)
 void sink_size(sink_t *s, int *w, int *h)
 {
     if (!s->shm)
-        s->shm = mcam_shm_open(&s->map);
+        s->shm = mcam_shm_open(&s->map, slot());
     *w = s->w;
     *h = s->h;
     if (s->shm && s->shm->req_width > 0 && s->shm->req_width <= MCAM_MAX_W && s->shm->req_height > 0 &&

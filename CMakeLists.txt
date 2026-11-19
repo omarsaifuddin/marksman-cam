@@ -41,7 +41,7 @@ if(WIN32)
     "${CMAKE_BINARY_DIR}/marksman-cam.exe;${CMAKE_BINARY_DIR}/marksman-cam-vcam.dll;${CMAKE_SOURCE_DIR}/installer/setup.manifest")
   add_executable(marksman-cam-setup WIN32 installer/setup.c ${CMAKE_BINARY_DIR}/setup.rc)
   add_dependencies(marksman-cam-setup marksman-cam marksman-cam-vcam)
-  target_link_libraries(marksman-cam-setup advapi32)
+  target_link_libraries(marksman-cam-setup advapi32 comctl32)
   target_link_options(marksman-cam-setup PRIVATE -static)
 
   add_executable(vcam_probe test/vcam_probe.c)

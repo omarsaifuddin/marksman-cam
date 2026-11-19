@@ -1,7 +1,7 @@
-/* Media Foundation custom media source behind the "Marksman Cam" virtual camera.
-   marksman-cam.exe calls MFCreateVirtualCamera with MCAM_SOURCE_CLSID; the Windows Camera Frame Server then
-   loads this DLL (as LocalService) and asks it for frames, which it copies out of the shared section that
-   marksman-cam.exe fills. Advertises NV12 at 1280x720 (default), 1920x1080 and 640x360, 30 fps. */
+/* Media Foundation custom media source behind the "Marksman Cam" virtual cameras.
+   marksman-cam.exe calls MFCreateVirtualCamera with one of the mcam_clsid slots; the Windows Camera Frame
+   Server then loads this DLL (as LocalService) and asks it for frames, which it copies out of that slot's
+   shared section. Advertises NV12 at 1280x720 (default), 1920x1080 and 640x360, 30 fps. */
 #include <windows.h>
 #include <sddl.h>
 #include <mfapi.h>
@@ -21,7 +21,6 @@ static const GUID kFrameSourceTypes  = {0x17145fd1, 0x1b2b, 0x423c, {0x80, 0x01,
 static const GUID kPinVideoCapture   = {0xfb6c4281, 0x0353, 0x11d1, {0x90, 0x5f, 0x00, 0x00, 0xc0, 0xcc, 0x16, 0xba}};
 static const IID kIID_IKsControl      = {0x28f54685, 0x06fd, 0x11d2, {0xb2, 0x7a, 0x00, 0xa0, 0xc9, 0x22, 0x31, 0x96}};
 static const IID kIID_IMFMediaStream2 = {0xc5bc37d6, 0x75c7, 0x46a1, {0xa1, 0x32, 0x81, 0xb5, 0xf7, 0x23, 0xc2, 0x0f}};
-static const CLSID kClsid = MCAM_SOURCE_CLSID;
 
 /* User-mode IKsControl (ksproxy.h); MinGW's ks.h only has the kernel-mode NTSTATUS flavour. */
 struct IKsControl_ : IUnknown {
@@ -48,7 +47,7 @@ class Source;
 
 class Stream final : public IMFMediaStream2_, public IKsControl_ {
 public:
-    Stream(Source *src, IMFStreamDescriptor *sd) : src_(src), sd_(sd)
+    Stream(Source *src, IMFStreamDescriptor *sd, int slot) : src_(src), sd_(sd), slot_(slot)
     {
         sd_->AddRef();
         InitializeSRWLock(&lock_);
@@ -159,7 +158,7 @@ private:
     {
         const size_t size = (size_t)w * h * 3 / 2;
         if (!shm_)
-            shm_ = mcam_shm_open(&map_);
+            shm_ = mcam_shm_open(&map_, slot_);
         if (shm_) {
             shm_->req_width = (LONG)w;
             shm_->req_height = (LONG)h;
@@ -199,6 +198,7 @@ private:
     LONG ref_ = 1;
     Source *src_;
     IMFStreamDescriptor *sd_;
+    int slot_;
     IMFMediaEventQueue *queue_ = nullptr;
     SRWLOCK lock_;
     MF_STREAM_STATE state_ = MF_STREAM_STATE_STOPPED;
@@ -286,7 +286,7 @@ static HRESULT MakeType(UINT32 w, UINT32 h, IMFMediaType **out)
 
 class Source final : public IMFMediaSourceEx, public IMFGetService, public IKsControl_ {
 public:
-    Source()
+    explicit Source(int slot) : slot_(slot)
     {
         InitializeSRWLock(&lock_);
         InterlockedIncrement(&g_objects);
@@ -324,7 +324,7 @@ public:
         if (SUCCEEDED(hr))
             hr = pd_->SelectStream(0);
         if (SUCCEEDED(hr))
-            hr = (stream_ = new (std::nothrow) Stream(this, sd)) ? stream_->Init() : E_OUTOFMEMORY;
+            hr = (stream_ = new (std::nothrow) Stream(this, sd, slot_)) ? stream_->Init() : E_OUTOFMEMORY;
         for (UINT32 i = 0; i < n; i++)
             if (types[i])
                 types[i]->Release();
@@ -503,6 +503,7 @@ private:
     IMFAttributes *attrs_ = nullptr;
     IMFPresentationDescriptor *pd_ = nullptr;
     Stream *stream_ = nullptr;
+    int slot_;
 };
 
 HRESULT Stream::GetMediaSource(IMFMediaSource **pp)
@@ -517,7 +518,7 @@ HRESULT Stream::GetMediaSource(IMFMediaSource **pp)
 /* The Frame Server instantiates the CLSID as an IMFActivate and activates the source from it. */
 class Activator final : public IMFActivate {
 public:
-    Activator() { InterlockedIncrement(&g_objects); }
+    explicit Activator(int slot) : slot_(slot) { InterlockedIncrement(&g_objects); }
     HRESULT Init() { return MFCreateAttributes(&attrs_, 1); }
 
     STDMETHODIMP QueryInterface(REFIID iid, void **pp) override
@@ -542,7 +543,7 @@ public:
     STDMETHODIMP ActivateObject(REFIID iid, void **pp) override
     {
         if (!src_) {
-            if (!(src_ = new (std::nothrow) Source))
+            if (!(src_ = new (std::nothrow) Source(slot_)))
                 return E_OUTOFMEMORY;
             HRESULT hr = src_->Init(attrs_);
             if (FAILED(hr)) {
@@ -614,12 +615,14 @@ private:
     }
 
     LONG ref_ = 1;
+    int slot_;
     IMFAttributes *attrs_ = nullptr;
     Source *src_ = nullptr;
 };
 
 class Factory final : public IClassFactory {
 public:
+    explicit Factory(int slot) : slot_(slot) {}
     STDMETHODIMP QueryInterface(REFIID iid, void **pp) override
     {
         if (!pp)
@@ -635,7 +638,7 @@ public:
     {
         if (outer)
             return CLASS_E_NOAGGREGATION;
-        Activator *a = new (std::nothrow) Activator;
+        Activator *a = new (std::nothrow) Activator(slot_);
         if (!a)
             return E_OUTOFMEMORY;
         HRESULT hr = a->Init();
@@ -649,10 +652,17 @@ public:
         lock ? InterlockedIncrement(&g_objects) : InterlockedDecrement(&g_objects);
         return S_OK;
     }
+
+private:
+    int slot_;
 };
 
-static Factory g_factory;
-#define CLSID_KEY L"SOFTWARE\\Classes\\CLSID\\" MCAM_SOURCE_CLSID_STR
+static Factory g_factory[MCAM_SLOTS] = {Factory(0), Factory(1), Factory(2)};
+
+static void clsid_key(int slot, const wchar_t *sub, wchar_t *key)
+{
+    _snwprintf(key, 128, L"SOFTWARE\\Classes\\CLSID\\%ls%ls", mcam_clsid_str[slot], sub);
+}
 
 extern "C" BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID)
 {
@@ -665,7 +675,10 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID)
 
 STDAPI DllGetClassObject(REFCLSID clsid, REFIID iid, LPVOID *pp)
 {
-    return clsid == kClsid ? g_factory.QueryInterface(iid, pp) : CLASS_E_CLASSNOTAVAILABLE;
+    for (int i = 0; i < MCAM_SLOTS; i++)
+        if (clsid == mcam_clsid[i])
+            return g_factory[i].QueryInterface(iid, pp);
+    return CLASS_E_CLASSNOTAVAILABLE;
 }
 
 STDAPI DllCanUnloadNow(void)
@@ -680,16 +693,29 @@ STDAPI DllRegisterServer(void)
     DWORD n = GetModuleFileNameW(g_module, path, MAX_PATH);
     if (!n || n == MAX_PATH)
         return E_FAIL;
-    LSTATUS s = RegSetKeyValueW(HKEY_LOCAL_MACHINE, CLSID_KEY, nullptr, REG_SZ, L"Marksman Cam Source", sizeof L"Marksman Cam Source");
-    if (!s)
-        s = RegSetKeyValueW(HKEY_LOCAL_MACHINE, CLSID_KEY L"\\InprocServer32", nullptr, REG_SZ, path, (n + 1) * sizeof(wchar_t));
-    if (!s)
-        s = RegSetKeyValueW(HKEY_LOCAL_MACHINE, CLSID_KEY L"\\InprocServer32", L"ThreadingModel", REG_SZ, L"Both", sizeof L"Both");
+    LSTATUS s = 0;
+    wchar_t key[128], ips[128];
+    for (int i = 0; i < MCAM_SLOTS && !s; i++) {
+        clsid_key(i, L"", key);
+        clsid_key(i, L"\\InprocServer32", ips);
+        s = RegSetKeyValueW(HKEY_LOCAL_MACHINE, key, nullptr, REG_SZ, L"Marksman Cam Source", sizeof L"Marksman Cam Source");
+        if (!s)
+            s = RegSetKeyValueW(HKEY_LOCAL_MACHINE, ips, nullptr, REG_SZ, path, (n + 1) * sizeof(wchar_t));
+        if (!s)
+            s = RegSetKeyValueW(HKEY_LOCAL_MACHINE, ips, L"ThreadingModel", REG_SZ, L"Both", sizeof L"Both");
+    }
     return HRESULT_FROM_WIN32(s);
 }
 
 STDAPI DllUnregisterServer(void)
 {
-    LSTATUS s = RegDeleteTreeW(HKEY_LOCAL_MACHINE, CLSID_KEY);
-    return s == ERROR_FILE_NOT_FOUND ? S_OK : HRESULT_FROM_WIN32(s);
+    LSTATUS s = 0;
+    wchar_t key[128];
+    for (int i = 0; i < MCAM_SLOTS; i++) {
+        clsid_key(i, L"", key);
+        LSTATUS r = RegDeleteTreeW(HKEY_LOCAL_MACHINE, key);
+        if (r && r != ERROR_FILE_NOT_FOUND)
+            s = r;
+    }
+    return HRESULT_FROM_WIN32(s);
 }

@@ -1,6 +1,9 @@
-/* Double-click installer. Embeds marksman-cam.exe + marksman-cam-vcam.dll, runs "marksman-cam.exe --install" with no
-   console, and adds a Settings > Apps entry whose Uninstall runs "marksman-cam-setup.exe /uninstall". */
+/* Double-click installer. Embeds marksman-cam.exe + marksman-cam-vcam.dll, asks which cameras to set up, runs
+   "marksman-cam.exe --install --camera X" per choice (each its own virtual camera and service) with no console,
+   and adds a Settings > Apps entry: Modify re-runs this picker, Uninstall runs "marksman-cam-setup.exe /uninstall". */
+#define _WIN32_WINNT 0x0A00
 #include <windows.h>
+#include <commctrl.h>
 #include <stdio.h>
 #include <string.h>
 #include <wchar.h>
@@ -71,18 +74,53 @@ static void error(const char *msg)
     MessageBoxA(NULL, msg, "Marksman Cam Setup", MB_ICONERROR);
 }
 
+enum { BOTH = 100, CANON, SONY };
+
+/* Returns BOTH, CANON or SONY, or 0 if cancelled. */
+static int pick_cameras(void)
+{
+    const TASKDIALOG_BUTTON radios[] = {
+        {BOTH, L"Canon and Sony\nTwo cameras in your apps: \"Marksman Cam (Canon)\" and \"Marksman Cam (Sony)\""},
+        {CANON, L"Canon only\n\"Marksman Cam (Canon)\""},
+        {SONY, L"Sony only\n\"Marksman Cam (Sony)\""},
+    };
+    TASKDIALOGCONFIG c = {.cbSize = sizeof c,
+                          .dwFlags = TDF_ALLOW_DIALOG_CANCELLATION,
+                          .dwCommonButtons = TDCBF_OK_BUTTON | TDCBF_CANCEL_BUTTON,
+                          .pszWindowTitle = TITLE,
+                          .pszMainInstruction = L"Which cameras do you want to use?",
+                          .pszContent = L"Each camera gets its own entry in Zoom, Teams, OBS and other apps, and its "
+                                        L"own background service that wakes it only while an app uses it.\n\n"
+                                        L"Run setup again (or Modify in Settings > Apps) to change this.",
+                          .cRadioButtons = 3,
+                          .pRadioButtons = radios,
+                          .nDefaultRadioButton = BOTH};
+    int button = 0, radio = 0;
+    if (FAILED(TaskDialogIndirect(&c, &button, &radio, NULL)) || button != IDOK)
+        return 0;
+    return radio;
+}
+
 static int install(void)
 {
     wchar_t tmp[MAX_PATH], texe[MAX_PATH], tdll[MAX_PATH], self[MAX_PATH], cmd[2 * MAX_PATH];
     char out[4096];
     HKEY k;
-
-    if (MessageBoxW(NULL,
-                    L"Install Marksman Cam?\n\nThis adds an \"Marksman Cam\" camera for all apps and a background "
-                    L"service that wakes your camera only while an app uses it.\n\nIf it is already "
-                    L"installed, this upgrades it.",
-                    TITLE, MB_OKCANCEL | MB_ICONQUESTION) != IDOK)
+    int choice = pick_cameras();
+    if (!choice)
         return 1;
+    /* Unwanted slots go first (harmless when absent), including a plain any-make one from a command-line install. */
+    const char *steps[4], *what;
+    int nsteps = 0;
+    steps[nsteps++] = "--uninstall --camera any";
+    if (choice == SONY)
+        steps[nsteps++] = "--uninstall --camera canon";
+    if (choice == CANON)
+        steps[nsteps++] = "--uninstall --camera sony";
+    if (choice != SONY)
+        steps[nsteps++] = "--install --camera canon";
+    if (choice != CANON)
+        steps[nsteps++] = "--install --camera sony";
 
     /* --install copies the files from wherever it runs into Program Files, so stage them in %TEMP%. */
     GetTempPathW(MAX_PATH, tmp);
@@ -94,8 +132,11 @@ static int install(void)
         error("Could not unpack the program files into %TEMP%.");
         return 1;
     }
-    swprintf(cmd, 2 * MAX_PATH, L"\"%ls\" --install", texe);
-    DWORD code = run(cmd, out, sizeof out);
+    DWORD code = 0;
+    for (int i = 0; i < nsteps && !code; i++) {
+        swprintf(cmd, 2 * MAX_PATH, L"\"%ls\" %hs", texe, steps[i]);
+        code = run(cmd, out, sizeof out);
+    }
     DeleteFileW(texe);
     DeleteFileW(tdll);
     RemoveDirectoryW(tmp);
@@ -115,14 +156,21 @@ static int install(void)
         reg_str(k, L"InstallLocation", dir);
         reg_str(k, L"DisplayIcon", exe);
         reg_str(k, L"UninstallString", cmd);
-        reg_dword(k, L"NoModify", 1);
+        swprintf(cmd, 2 * MAX_PATH, L"\"%ls\"", setup);
+        reg_str(k, L"ModifyPath", cmd); /* Modify re-runs the camera picker */
+        reg_dword(k, L"NoModify", 0);
         reg_dword(k, L"NoRepair", 1);
         RegCloseKey(k);
     }
-    MessageBoxW(NULL,
-                L"Marksman Cam is installed.\n\nPlug in your camera (Canon: shooting or Movie mode; Sony: USB "
-                L"Connection set to PC Remote; auto power-off disabled) and pick \"Marksman Cam\" in any app.\n\nTo remove it: Settings > Apps > Installed apps.",
-                TITLE, MB_OK | MB_ICONINFORMATION);
+    what = choice == BOTH ? "\"Marksman Cam (Canon)\" and \"Marksman Cam (Sony)\" are"
+           : choice == CANON ? "\"Marksman Cam (Canon)\" is"
+                             : "\"Marksman Cam (Sony)\" is";
+    snprintf(out, sizeof out,
+             "%s installed.\n\nCanon: use a shooting mode (Movie mode where available).\nSony: MENU > Setup > USB "
+             "Connection: PC Remote, with Ctrl w/ Smartphone off.\nBoth: turn auto power-off off.\n\nThen pick the "
+             "camera in any app.\nTo change cameras or remove: Settings > Apps > Installed apps > Marksman Cam.",
+             what);
+    MessageBoxA(NULL, out, "Marksman Cam Setup", MB_OK | MB_ICONINFORMATION);
     return 0;
 }
 

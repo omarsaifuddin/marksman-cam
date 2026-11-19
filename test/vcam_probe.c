@@ -1,4 +1,5 @@
-/* Windows check: opens the "Marksman Cam" virtual camera like any app would and reads 90 frames.
+/* Windows check: opens a Marksman Cam virtual camera like any app would and reads 90 frames.
+   Usage: vcam_probe ["Marksman Cam (Sony)"]; with no argument, the first camera named Marksman Cam*.
    Luma 57 = marksman-cam.exe's "no camera" grey made it through; 48 = the DLL's own fallback (app not
    feeding frames); anything else = live picture. The timeline shows P (picture) / G (fallback grey) per
    frame: any G between Ps is a visible flicker. */
@@ -10,13 +11,16 @@
 #include <stdio.h>
 #include <wchar.h>
 
-int main(void)
+int main(int argc, char **argv)
 {
+    wchar_t want[128] = L"Marksman Cam";
     IMFAttributes *attrs;
     IMFActivate **devs = NULL;
     UINT32 n = 0;
     int found = 0;
 
+    if (argc > 1)
+        MultiByteToWideChar(CP_UTF8, 0, argv[1], -1, want, 128);
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
     MFStartup(MF_VERSION, MFSTARTUP_FULL);
     MFCreateAttributes(&attrs, 1);
@@ -28,7 +32,7 @@ int main(void)
         UINT32 len;
         IMFActivate_GetAllocatedString(devs[i], &MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, &name, &len);
         wprintf(L"camera: %ls\n", name);
-        if (name && wcsstr(name, L"Marksman Cam") && !found) {
+        if (name && wcsstr(name, want) == name && !found) {
             IMFMediaSource *src;
             IMFSourceReader *reader;
             IMFSample *sample = NULL;

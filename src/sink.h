@@ -11,7 +11,8 @@ int sink_write(sink_t *s, const uint8_t *bgrx, const view_t *v); /* frame is sin
 void sink_close(sink_t *s);
 
 #ifdef _WIN32
+/* On Windows, --camera (eos_only_vid) picks the slot: "Marksman Cam", "Marksman Cam (Canon)" or "(Sony)". */
 sink_t *sink_open_shared(int w, int h);     /* frames only; for the service, with the camera installed system-wide */
-long vcam_install(const char *name);        /* persistent, all-users "Marksman Cam"; needs admin. HRESULT */
-long vcam_uninstall(const char *name);
+long vcam_install(int slot);                /* persistent, all-users virtual camera for a slot; needs admin. HRESULT */
+long vcam_uninstall(int slot);
 #endif

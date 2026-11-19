@@ -51,17 +51,19 @@ static const char usage[] =
     "  --hue DEG\n"
     "  --set NAME=VALUE  camera property once connected; NAME is av tv iso ec wb kelvin style or a hex\n"
     "                    property code; VALUE is the Canon raw code (iso 0x48=100 .. 0x70=3200), kelvin in K\n"
-    "  --camera canon|sony  use only that make when several cameras are plugged in (put it first)\n"
+    "  --camera canon|sony|any  use only that make (default any); put it first. On Windows each choice is\n"
+    "                    its own virtual camera: \"Marksman Cam (Canon)\", \"Marksman Cam (Sony)\", \"Marksman Cam\"\n"
     "  --snapshot FILE   save one live-view JPEG and exit (camera check, no virtual camera needed)\n"
 #ifdef _WIN32
-    "  --install [opts]  (admin) permanent \"Marksman Cam\" + background service; opts become its settings\n"
-    "  --uninstall       (admin) remove both\n"
+    "  --install [opts]  (admin) permanent virtual camera + background service for --camera; opts become its\n"
+    "                    settings. Run once per camera to have several, e.g. --camera canon, then --camera sony\n"
+    "  --uninstall       (admin) remove everything; with --camera, only that camera's service and virtual camera\n"
 #endif
     ;
 
 #ifdef _WIN32
 int winsvc_install(int argc, char **argv);
-int winsvc_uninstall(void);
+int winsvc_uninstall(int all);
 int winsvc_run(int (*body)(void), volatile sig_atomic_t *stop);
 #endif
 
@@ -300,7 +302,7 @@ static int run_service(void)
 int main(int argc, char **argv)
 {
     const char *device = NULL;
-    int install = 0, uninstall = 0, service = 0;
+    int install = 0, uninstall = 0, service = 0, camera_given = 0;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i], *val = i + 1 < argc ? argv[i + 1] : NULL;
@@ -347,10 +349,13 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--set") && nsets < MAX_SETS && strchr(val, '='))
             sets[nsets++] = val;
         else if (!strcmp(a, "--camera")) {
+            camera_given = 1;
             if (!strcmp(val, "canon"))
                 eos_only_vid = 0x04A9;
             else if (!strcmp(val, "sony"))
                 eos_only_vid = 0x054C;
+            else if (!strcmp(val, "any"))
+                eos_only_vid = 0;
             else
                 goto bad;
         } else if (!strcmp(a, "--snapshot"))
@@ -366,10 +371,11 @@ int main(int argc, char **argv)
     if (install)
         return winsvc_install(argc, argv);
     if (uninstall)
-        return winsvc_uninstall();
+        return winsvc_uninstall(!camera_given);
     if (service)
         return winsvc_run(run_service, &stop);
 #else
+    (void)camera_given;
     if (install || uninstall || service)
         goto bad; /* Linux: systemd unit + udev rule, see README */
 #endif

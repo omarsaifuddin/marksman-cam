@@ -48,22 +48,31 @@ sudo pacman -S --needed base-devel cmake ninja pkgconf libusb libjpeg-turbo v4l2
 cmake -S . -B build -G Ninja && cmake --build build && ctest --test-dir build
 sudo cmake --install build                       # /usr/local/bin/marksman-cam
 
-# virtual camera device, persistent
+# virtual camera devices, persistent: one per physical camera (Canon -> video10, Sony -> video11)
 echo v4l2loopback | sudo tee /etc/modules-load.d/v4l2loopback.conf
-echo 'options v4l2loopback video_nr=10 card_label="Marksman Cam" exclusive_caps=1' | sudo tee /etc/modprobe.d/v4l2loopback.conf
-sudo modprobe v4l2loopback
+echo 'options v4l2loopback devices=2 video_nr=10,11 card_label="Marksman Cam (Canon)","Marksman Cam (Sony)" exclusive_caps=1,1' | sudo tee /etc/modprobe.d/v4l2loopback.conf
+sudo modprobe -r v4l2loopback; sudo modprobe v4l2loopback
 
-# let your user open the camera without root
+# let your user open the cameras without root
 printf 'SUBSYSTEM=="usb", ATTR{idVendor}=="%s", TAG+="uaccess"\n' 04a9 054c | sudo tee /etc/udev/rules.d/70-marksman-cam.rules
 sudo udevadm control --reload && sudo udevadm trigger
 
-marksman-cam            # then pick "Marksman Cam" in your app; check with: ffplay /dev/video10
+marksman-cam --camera canon --snapshot canon.jpg   # each camera on its own first
+marksman-cam --camera sony --snapshot sony.jpg
+marksman-cam --camera canon -d /dev/video10 &      # then both at once
+marksman-cam --camera sony -d /dev/video11 &       # check with: ffplay /dev/video10, ffplay /dev/video11
 ```
+- One camera only: `devices=1 video_nr=10 card_label="Marksman Cam" exclusive_caps=1`, and plain `marksman-cam` (any make, `/dev/video10`).
 - "camera held by another program": gvfs grabs PTP cameras. Run `pkill -f gvfs-gphoto2-volume-monitor`, or `sudo pacman -R gvfs-gphoto2`.
 - Secure Boot: sign the v4l2loopback DKMS module, or it will not load.
-- Run on login with a user service, `~/.config/systemd/user/marksman-cam.service`:
-  `[Service]` with `ExecStart=/usr/local/bin/marksman-cam` and `Restart=always`. Then `systemctl --user enable --now marksman-cam`.
-- Several cameras: run more instances on `/dev/video11` and up (`v4l2loopback devices=2 video_nr=10,11`). Each instance opens the first free supported camera.
+- Run on login: one user service per camera, the Linux counterpart of the Windows services. `~/.config/systemd/user/marksman-cam@.service`:
+  ```ini
+  [Service]
+  ExecStart=/usr/local/bin/marksman-cam --camera %i -d /dev/video${DEV}
+  Restart=always
+  ```
+  plus `Environment=DEV=10` / `DEV=11` in `systemctl --user edit marksman-cam@canon` / `@sony`. Then `systemctl --user enable --now marksman-cam@canon marksman-cam@sony`.
+- On Linux the camera streams for as long as its process runs (v4l2loopback doesn't report when an app is reading); stop the unit to let the camera sleep.
 - Other distros need the same packages: Debian/Ubuntu `libusb-1.0-0-dev libturbojpeg0-dev v4l2loopback-dkms`; Fedora `libusb1-devel turbojpeg-devel` plus `akmod-v4l2loopback` from RPM Fusion.
 
 ## Windows 11
@@ -74,32 +83,34 @@ Requires build 22000 or newer, which has `MFCreateVirtualCamera`.
    pacman -S --needed mingw-w64-ucrt-x86_64-{gcc,cmake,ninja,pkgconf,libusb,libjpeg-turbo}
    cmake -S . -B build -G Ninja && cmake --build build && ctest --test-dir build
    ```
-2. **Install**: double-click `build\marksman-cam-setup.exe`. It is a single file you can copy to any PC. Accept the admin prompt and click OK. Remove it later from Settings > Apps > Installed apps. It runs the same `--install` as below, without a console window. Or, from an elevated prompt:
+2. **Install**: double-click `build\marksman-cam-setup.exe`. It is a single file you can copy to any PC. Accept the admin prompt and pick **Canon and Sony**, **Canon only** or **Sony only**. To change the choice later, run it again or use Modify in Settings > Apps > Installed apps; Uninstall there removes everything. It runs the same commands as below, without a console window. Or, from an elevated prompt, once per camera:
    ```bat
-   build\marksman-cam.exe --install
+   build\marksman-cam.exe --install --camera canon
+   build\marksman-cam.exe --install --camera sony
    ```
-   This does everything:
-   - Copies `marksman-cam.exe` and `marksman-cam-vcam.dll` to `C:\Program Files\marksman-cam`.
+   Each `--install --camera X` does everything for that camera:
+   - Copies `marksman-cam.exe` and `marksman-cam-vcam.dll` to `C:\Program Files\marksman-cam` (shared by all cameras).
    - Registers the media source.
-   - Creates a **permanent, all-users "Marksman Cam"** camera.
-   - Installs and starts the **`marksman-cam` service**: automatic start, restarts if it crashes, log at `C:\ProgramData\marksman-cam.log`.
+   - Creates a **permanent, all-users virtual camera**: "Marksman Cam (Canon)" or "Marksman Cam (Sony)".
+   - Installs and starts **its own service**, `marksman-cam-canon` or `marksman-cam-sony`: automatic start, restarts if it crashes, log at `C:\ProgramData\marksman-cam-canon.log` / `-sony.log`.
+   - Plain `--install` (no `--camera`) gives one "Marksman Cam" for any make, service `marksman-cam`.
 
-   After that there is nothing to run. Plug the camera in and open the webcam in any app:
-   - The service wakes the camera and starts live view only while an app is reading "Marksman Cam".
+   After that there is nothing to run. Plug the cameras in and pick one (or both) in any app:
+   - Each service wakes its camera and starts live view only while an app is reading that virtual camera.
    - It switches live view off 3 s after the last app lets go. The camera is then free for other software, or can sleep.
    - With no camera plugged in, apps get a grey frame until one appears.
 
    Notes:
-   - Options after `--install` become the service's settings (e.g. `--install --mirror --fill`). Re-run `--install` to change them or to upgrade; it stops the old service and the Frame Server first so the files can be replaced.
+   - Options after `--install` become that camera's service settings (e.g. `--install --camera sony --mirror --fill`). Re-run it to change them or to upgrade; it stops all marksman-cam services and the Frame Server so the files can be replaced, then starts them again.
    - Quit any manually started marksman-cam.exe first.
-   - `marksman-cam --uninstall` removes the service, the camera and the registration. Then delete the folder.
+   - `marksman-cam --uninstall --camera sony` removes that camera's service and virtual camera. `marksman-cam --uninstall` removes all of them and the registration. Then delete the folder.
 3. **Camera driver: nothing to do.** marksman-cam talks PTP through Windows' own MTP driver (Windows Portable Devices vendor commands), so the camera keeps its normal driver and Explorer import keeps working. A camera you have bound to WinUSB yourself (e.g. with Zadig) is used through libusb instead.
    - Check the camera on its own: `marksman-cam --snapshot test.jpg` saves one live-view frame. It needs no virtual camera or admin rights.
-4. **Check:** `vcam_probe.exe` (in `build\`) opens "Marksman Cam" like an app and reads 90 frames. It reports:
+4. **Check:** `vcam_probe.exe "Marksman Cam (Sony)"` (in `build\`) opens that virtual camera like an app and reads 90 frames (no argument: the first Marksman Cam). A camera another app is using can't be probed (0xC00D3704). It reports:
    - fallback-grey frames (flicker);
    - delivered fps and distinct-picture fps;
    - the first frame's luma: **57** = no camera found (marksman-cam's grey), **48** = nothing is feeding the DLL (service not running), anything else = a live picture.
-5. **Without installing** (development): run `build\marksman-cam.exe` as a normal user. It creates a temporary "Marksman Cam" that disappears when it exits. The DLL must have been registered once (by `--install`, or `regsvr32`).
+5. **Without installing** (development): run `build\marksman-cam.exe [--camera canon|sony]` as a normal user. It creates a temporary virtual camera that disappears when it exits. The DLL must have been registered once (by `--install`, or `regsvr32`).
 
 ## Layout
 | File | What |
