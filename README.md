@@ -1,6 +1,6 @@
 # Marksman
 
-Turns a Canon EOS/PowerShot, or a Sony Alpha in PC Remote mode, connected over USB into a webcam on **Linux** and **Windows 11**. No vendor software, SDK, account or subscription: every feature is always on.
+Turns a Canon EOS/PowerShot, or a Sony Alpha in PC Remote mode, connected over USB into a webcam on **Linux** and **Windows 11**. No vendor software, account or subscription. Every feature is always on.
 
 Not affiliated with or endorsed by Canon Inc. or Sony Group Corporation. Canon, EOS, PowerShot and Rebel are trademarks of Canon Inc.; Sony and Alpha are trademarks of Sony Group Corporation.
 
