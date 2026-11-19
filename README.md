@@ -22,7 +22,7 @@ marksman-cam [-d DEV] [-s 1920x1080] [-r 30] [--fill] [--rotate 90] [--mirror] [
 ```
 - Start it and leave it running. It reconnects when the camera is unplugged, switched off, or restarted, and shows a grey frame while there is no camera.
 - `--set` values are Canon raw property codes (Canon only for now). Examples: iso `0x48`=100, `0x50`=200, `0x58`=400, `0x60`=800, `0x68`=1600, `0x00`=auto. Kelvin is plain Kelvin.
-- On Windows the app using the camera picks 640x360, 1280x720 or 1920x1080, and marksman-cam renders at that size.
+- On Windows the app using the camera picks 640x360, 1280x720 or 1920x1080, and marksman-cam renders at that size. On Linux the size is fixed by `-s` (default 1280x720).
 
 Tested under Windows 11 on an EOS Rebel T5i / 700D (live view 960x640) and a Sony a6400 in PC Remote mode (live view 1024x576 at a steady 20 fps over USB, through the stock Windows driver).
 
@@ -42,38 +42,41 @@ Camera prep:
 - Sony (e.g. a6400): MENU > Setup > **USB Connection: PC Remote** (not Mass Storage/MTP). Any shooting mode.
 - Close any other program using the camera (gphoto2, Canon or Sony software). Only one program can own it.
 
-## Linux (Arch)
+## Linux
+Works on any systemd distribution with v4l2loopback: Arch (and CachyOS, EndeavourOS, Manjaro), Debian/Ubuntu (and Mint, Pop!_OS), Fedora, openSUSE, Void. Run as your normal user; it asks for sudo where it needs root:
 ```sh
-sudo pacman -S --needed base-devel cmake ninja pkgconf libusb libjpeg-turbo v4l2loopback-dkms linux-headers
-cmake -S . -B build -G Ninja && cmake --build build && ctest --test-dir build
-sudo cmake --install build                       # /usr/local/bin/marksman-cam
-
-# virtual camera devices, persistent: one per physical camera (Canon -> video10, Sony -> video11)
-echo v4l2loopback | sudo tee /etc/modules-load.d/v4l2loopback.conf
-echo 'options v4l2loopback devices=2 video_nr=10,11 card_label="Marksman Cam (Canon)","Marksman Cam (Sony)" exclusive_caps=1,1' | sudo tee /etc/modprobe.d/v4l2loopback.conf
-sudo modprobe -r v4l2loopback; sudo modprobe v4l2loopback
-
-# let your user open the cameras without root
-printf 'SUBSYSTEM=="usb", ATTR{idVendor}=="%s", TAG+="uaccess"\n' 04a9 054c | sudo tee /etc/udev/rules.d/70-marksman-cam.rules
-sudo udevadm control --reload && sudo udevadm trigger
-
-marksman-cam --camera canon --snapshot canon.jpg   # each camera on its own first
-marksman-cam --camera sony --snapshot sony.jpg
-marksman-cam --camera canon -d /dev/video10 &      # then both at once
-marksman-cam --camera sony -d /dev/video11 &       # check with: ffplay /dev/video10, ffplay /dev/video11
+./install.sh                      # Canon and Sony, each its own virtual camera
+./install.sh --camera sony        # or: canon | sony | both | any
+./install.sh -- --fill --mirror   # options after -- go to the services
+./install.sh --uninstall
 ```
-- One camera only: `devices=1 video_nr=10 card_label="Marksman Cam" exclusive_caps=1`, and plain `marksman-cam` (any make, `/dev/video10`).
-- "camera held by another program": gvfs grabs PTP cameras. Run `pkill -f gvfs-gphoto2-volume-monitor`, or `sudo pacman -R gvfs-gphoto2`.
-- Secure Boot: sign the v4l2loopback DKMS module, or it will not load.
-- Run on login: one user service per camera, the Linux counterpart of the Windows services. `~/.config/systemd/user/marksman-cam@.service`:
-  ```ini
-  [Service]
-  ExecStart=/usr/local/bin/marksman-cam --camera %i -d /dev/video${DEV}
-  Restart=always
-  ```
-  plus `Environment=DEV=10` / `DEV=11` in `systemctl --user edit marksman-cam@canon` / `@sony`. Then `systemctl --user enable --now marksman-cam@canon marksman-cam@sony`.
-- On Linux the camera streams for as long as its process runs (v4l2loopback doesn't report when an app is reading); stop the unit to let the camera sleep.
-- Other distros need the same packages: Debian/Ubuntu `libusb-1.0-0-dev libturbojpeg0-dev v4l2loopback-dkms`; Fedora `libusb1-devel turbojpeg-devel` plus `akmod-v4l2loopback` from RPM Fusion.
+It does the same job as the Windows setup:
+- Installs the build tools, libusb, libjpeg-turbo and v4l2loopback with the distro's package manager. It skips v4l2loopback when the kernel already ships it (CachyOS does). On Arch it installs headers for every installed kernel; Fedora needs RPM Fusion for `akmod-v4l2loopback`. `--no-deps` skips this step.
+- Builds, runs the self-test, and installs `/usr/local/bin/marksman-cam` (`--prefix` to change).
+- Creates one v4l2loopback device per camera, persistent across reboots: **"Marksman Cam (Canon)"** (`/dev/video10`), **"Marksman Cam (Sony)"** (`/dev/video11`), or **"Marksman Cam"** for `--camera any`. Config: `/etc/modprobe.d/marksman-cam.conf` and `/etc/modules-load.d/marksman-cam.conf`. `--obs` adds a spare "OBS Virtual Camera" device so OBS doesn't need one of these.
+- Installs `/etc/udev/rules.d/70-marksman-cam.rules`. It lets the logged-in user open Canon/Sony PTP cameras without root, and removes the libgphoto2/libmtp tags from those cameras so gvfs (GNOME, Xfce, Cinnamon) stops mounting them and locking marksman-cam out. Other cameras are not affected.
+- Enables one **systemd user service** per camera, `marksman-cam@canon` / `@sony` / `@any`, started at login and restarted if it crashes.
+
+After that there is nothing to run. Plug the camera in and pick it in any app:
+- The service wakes the camera and starts live view only while an app is streaming from its device (v4l2loopback 0.13+ reports this; with older modules, any other process holding the device open counts).
+- It switches live view off 3 s after the last app stops. The camera can then sleep or be used by other software.
+- While nobody is watching, or no camera is plugged in, apps get a grey frame.
+
+Day to day:
+```sh
+journalctl --user -u marksman-cam@sony -f          # log
+$EDITOR ~/.config/marksman-cam/sony.conf           # OPTIONS="--fill -s 1920x1080 --set iso=0x48"
+systemctl --user restart marksman-cam@sony
+systemctl --user stop marksman-cam@sony            # frees the camera; then check it on its own:
+marksman-cam --camera sony --snapshot sony.jpg
+ffplay /dev/video11                                # or open the camera in a browser
+```
+- `-d` takes a path or a card label (`-d "Marksman Cam (Sony)"`). Without it marksman-cam finds the device labelled for `--camera`, so the `/dev/videoN` numbers don't matter. It refuses to write to anything that isn't a v4l2loopback device.
+- "camera held by another program": something opened it before the udev rule applied. Unplug and replug it, or `pkill -f gvfs-gphoto2-volume-monitor`.
+- "the camera reports itself busy over USB": the camera is stuck in an earlier session (for example from another computer). Switch it off and on.
+- Secure Boot: a DKMS-built v4l2loopback must be signed with an enrolled key (MOK), or it won't load. The installer warns when that is the problem.
+- `MARKSMAN_DEBUG=1 marksman-cam ...` traces every PTP operation.
+- Manual install, or a distro without systemd: `cmake -S . -B build -G Ninja && cmake --build build && sudo cmake --install build`, then set up the modprobe options and udev rule above by hand and start `marksman-cam --camera canon` from your session's autostart.
 
 ## Windows 11
 Requires build 22000 or newer, which has `MFCreateVirtualCamera`.
@@ -118,7 +121,9 @@ Requires build 22000 or newer, which has `MFCreateVirtualCamera`.
 | `src/ptp.c` | PTP over USB bulk, plus Canon EOS live view (remote mode, EVF output to PC, GetViewFinderData, keep-alive, properties) and Sony PC Remote live view (SDIO connect, live-view object 0xFFFFC002, property-poll keep-alive) |
 | `src/ptp_wpd.cpp` | Windows transport: the same PTP operations through the stock MTP driver |
 | `src/image.c` | JPEG decode, geometry (crop, rotate, mirror, fit/fill, bilinear scaling), picture controls, YUYV/NV12 |
-| `src/sink_v4l2.c` | Linux output |
+| `src/sink_v4l2.c` | Linux output: v4l2loopback device by label, demand detection (client-usage events or /proc) |
+| `install.sh` | Linux installer: packages, build, v4l2loopback devices, udev rule, user services |
+| `linux/` | systemd user unit template and udev rule |
 | `src/sink_mfvcam.c` | Windows output: shared memory plus `MFCreateVirtualCamera` (system lifetime when installed, session lifetime when run by hand) |
 | `src/winsvc.c` | `--install` / `--uninstall` and the Windows service |
 | `win/vcam_source.cpp` | The COM media source the Frame Server loads (IMFActivate → IMFMediaSourceEx/IKsControl → IMFMediaStream2) |

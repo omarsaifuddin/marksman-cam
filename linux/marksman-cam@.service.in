@@ -1,0 +1,17 @@
+# One instance per camera make: marksman-cam@canon, marksman-cam@sony, or marksman-cam@any.
+# Feeds the v4l2loopback device labelled "Marksman Cam (Canon)" / "(Sony)" / "Marksman Cam".
+# The camera is only woken while an app is streaming from that device.
+# Extra options (e.g. OPTIONS="--fill --mirror -s 1920x1080") go in ~/.config/marksman-cam/<instance>.conf
+[Unit]
+Description=Marksman Cam virtual webcam (%i)
+
+[Service]
+Type=simple
+Environment=OPTIONS=
+EnvironmentFile=-%E/marksman-cam/%i.conf
+ExecStart=@MARKSMAN_BIN@ --camera %i $OPTIONS
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

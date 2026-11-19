@@ -42,4 +42,5 @@ int eos_poll(ptp_t *p);                 /* drains events and keeps the camera aw
 int eos_frame(ptp_t *p, const uint8_t **jpeg, uint32_t *len); /* 1 frame, 0 not ready, -1 error */
 const uint8_t *eos_find_jpeg(const uint8_t *data, uint32_t len, uint32_t *jpeg_len);
 const uint8_t *sony_find_jpeg(const uint8_t *data, uint32_t len, uint32_t *jpeg_len);
+const char *eos_hint(ptp_t *p);         /* why a camera might be failing, if it can tell; else NULL */
 long eos_setting(const char *name);     /* "iso" -> 0xD103, ...; -1 if unknown */

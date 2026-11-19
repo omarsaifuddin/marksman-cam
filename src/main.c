@@ -40,7 +40,9 @@ static void sleep_s(double s)
 
 static const char usage[] =
     "usage: marksman-cam [options]\n"
-    "  -d DEV            Linux: v4l2loopback device (/dev/video10); Windows: camera name (\"Marksman Cam\")\n"
+    "  -d DEV            Linux: v4l2loopback device path or card label (default: the device labelled\n"
+    "                    \"Marksman Cam (Canon)\"/\"(Sony)\"/\"Marksman Cam\" for --camera, else /dev/video10);\n"
+    "                    Windows: camera name (\"Marksman Cam\")\n"
     "  -s WxH            output size, even numbers (1280x720; on Windows the app using the camera picks)\n"
     "  -r FPS            output frame rate (30)\n"
     "  --fill            crop to fill the frame instead of letterboxing\n"
@@ -84,6 +86,8 @@ static int snapshot(const char *path)
     }
     if ((rc = eos_start_liveview(cam)) != PTP_OK) {
         fprintf(stderr, "marksman-cam: live view start failed (0x%04x)\n", rc);
+        if (eos_hint(cam))
+            fprintf(stderr, "marksman-cam: %s\n", eos_hint(cam));
         eos_close(cam);
         return 1;
     }
@@ -178,7 +182,8 @@ static void *capture(void *arg)
         }
         waiting_said = 0;
         if ((rc = eos_start_liveview(cam)) != PTP_OK) {
-            fprintf(stderr, "marksman-cam: live view start failed (0x%04x); is the camera in a shooting mode?\n", rc);
+            fprintf(stderr, "marksman-cam: live view start failed (0x%04x); %s\n", rc,
+                    eos_hint(cam) ? eos_hint(cam) : "is the camera in a shooting mode?");
             eos_close(cam);
             sleep_s(2);
             continue;
@@ -218,7 +223,9 @@ static int run(sink_t *sink)
     uint32_t jpeg_len = 0;
     unsigned seen = 0;
     int sw = 0, sh = 0, have = 0, dirty = 1, last_w = 0, last_h = 0;
-    double next = now_s(), t;
+    double next = now_s(), t, idle_write = 0;
+    int idle_ready = 0;
+    (void)idle_write; /* Linux only */
     pthread_t thread;
 
     if (!sink || !canvas || pthread_create(&thread, NULL, capture, NULL))
@@ -229,10 +236,29 @@ static int run(sink_t *sink)
         int fresh = 0;
         sink_size(sink, &v.out_w, &v.out_h);
         if (!(watched = sink_watched(sink))) {
+#ifndef _WIN32
+            /* v4l2loopback with exclusive_caps=1 only lists the device as a camera while its writer
+               produces frames, so keep a cheap idle frame going: 2 fps, no camera traffic. */
+            if (now_s() - idle_write >= 0.5) {
+                idle_write = now_s();
+                if (v.out_w != last_w || v.out_h != last_h || !idle_ready) {
+                    status_frame(canvas, v.out_w, v.out_h);
+                    last_w = v.out_w;
+                    last_h = v.out_h;
+                    idle_ready = 1;
+                    dirty = 1; /* repaint the camera picture once someone watches again */
+                }
+                if (sink_write(sink, canvas, &v)) {
+                    perror("marksman-cam: writing frame");
+                    break;
+                }
+            }
+#endif
             sleep_s(0.1); /* nobody watching: no camera traffic, no rendering */
             next = now_s();
             continue;
         }
+        idle_ready = 0;
         pthread_mutex_lock(&latest.lock);
         if (latest.seq != seen) {
             seen = latest.seq;
@@ -376,8 +402,10 @@ int main(int argc, char **argv)
         return winsvc_run(run_service, &stop);
 #else
     (void)camera_given;
-    if (install || uninstall || service)
-        goto bad; /* Linux: systemd unit + udev rule, see README */
+    if (install || uninstall || service) {
+        fputs("marksman-cam: on Linux, install with ./install.sh (see README)\n", stderr);
+        return 2;
+    }
 #endif
     return run(sink_open(device, v.out_w, v.out_h, fps));
 

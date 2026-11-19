@@ -1,0 +1,12 @@
+# Marksman Cam: Canon (04a9) and Sony (054c) cameras in PTP mode (USB still-image interface 06/01/01).
+#  - uaccess: the logged-in user may open them without root (must sort before 73-seat-late.rules).
+#  - gvfs mounts PTP cameras they see tagged by libgphoto2 (ID_GPHOTO2) or libmtp (ID_MTP_DEVICE),
+#    which locks marksman-cam out ("camera held by another program"). Untag these cameras only.
+ACTION=="remove", GOTO="marksman_cam_end"
+SUBSYSTEM!="usb", GOTO="marksman_cam_end"
+ENV{DEVTYPE}!="usb_device", GOTO="marksman_cam_end"
+ATTR{idVendor}!="04a9|054c", GOTO="marksman_cam_end"
+IMPORT{builtin}="usb_id"
+ENV{ID_USB_INTERFACES}!="*:060101:*", GOTO="marksman_cam_end"
+TAG+="uaccess", ENV{ID_GPHOTO2}="", ENV{ID_MTP_DEVICE}="", ENV{ID_MEDIA_PLAYER}=""
+LABEL="marksman_cam_end"

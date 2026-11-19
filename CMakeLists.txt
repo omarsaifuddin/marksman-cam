@@ -50,7 +50,17 @@ if(WIN32)
 else()
   add_executable(marksman-cam src/main.c src/sink_v4l2.c)
   target_link_libraries(marksman-cam camcore Threads::Threads)
-  install(TARGETS marksman-cam RUNTIME DESTINATION bin)
+  include(GNUInstallDirs)
+  install(TARGETS marksman-cam RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+  # systemd user unit template (one instance per camera) and the udev rule. install.sh copies the
+  # rule into /etc/udev/rules.d; packagers can point UDEV_RULES_DIR at /usr/lib/udev/rules.d instead.
+  set(SYSTEMD_USER_UNIT_DIR "${CMAKE_INSTALL_PREFIX}/lib/systemd/user" CACHE PATH "systemd user unit directory")
+  set(UDEV_RULES_DIR "${CMAKE_INSTALL_FULL_DATADIR}/marksman-cam" CACHE PATH "udev rules directory")
+  set(MARKSMAN_BIN "${CMAKE_INSTALL_FULL_BINDIR}/marksman-cam")
+  configure_file(linux/marksman-cam@.service.in marksman-cam@.service @ONLY)
+  install(FILES ${CMAKE_BINARY_DIR}/marksman-cam@.service DESTINATION ${SYSTEMD_USER_UNIT_DIR})
+  install(FILES linux/70-marksman-cam.rules DESTINATION ${UDEV_RULES_DIR})
 endif()
 
 enable_testing()

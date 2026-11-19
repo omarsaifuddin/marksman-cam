@@ -37,6 +37,14 @@ enum { CMD = 1, DATA = 2, RESP = 3 };
 #define EVF_OFF 0
 #define EVF_PC  2
 
+static int debug(void) /* MARKSMAN_DEBUG=1: trace PTP operations and USB errors */
+{
+    static int d = -1;
+    if (d < 0)
+        d = getenv("MARKSMAN_DEBUG") != NULL;
+    return d;
+}
+
 static uint16_t rd16(const uint8_t *b) { return (uint16_t)(b[0] | b[1] << 8); }
 static uint32_t rd32(const uint8_t *b) { return b[0] | b[1] << 8 | b[2] << 16 | (uint32_t)b[3] << 24; }
 static void wr16(uint8_t *b, uint16_t v) { b[0] = (uint8_t)v; b[1] = (uint8_t)(v >> 8); }
@@ -114,6 +122,8 @@ int ptp_transact(ptp_t *p, uint16_t code, const uint32_t *params, int nparams,
             return p->dead = -1;
     }
     p->tid++; /* OpenSession must use transaction id 0, so count up after each operation */
+    if (debug())
+        fprintf(stderr, "ptp: op 0x%04x -> 0x%04x\n", code, rd16(p->buf + off + 4) == RESP ? rd16(p->buf + off + 6) : 0);
     return rd16(p->buf + off + 4) == RESP ? rd16(p->buf + off + 6) : -1;
 }
 
@@ -261,7 +271,10 @@ long eos_setting(const char *name)
 
 static int usb_bulk(void *ctx, uint8_t ep, uint8_t *buf, int len, int *got, unsigned timeout_ms)
 {
-    return libusb_bulk_transfer(ctx, ep, buf, len, got, timeout_ms);
+    int err = libusb_bulk_transfer(ctx, ep, buf, len, got, timeout_ms);
+    if (err && debug())
+        fprintf(stderr, "ptp: bulk ep 0x%02x, %d bytes: %s\n", ep, len, libusb_strerror(err));
+    return err;
 }
 
 uint16_t eos_only_vid;
@@ -335,6 +348,18 @@ static ptp_t *try_device(libusb_device *dev)
     }
     libusb_free_config_descriptor(cfg);
     return p;
+}
+
+/* PTP class request GET_DEVICE_STATUS. A camera that answers "busy" here before any operation has
+   gone through is wedged (seen on a Sony a6400 after another host's session) and needs a power cycle. */
+const char *eos_hint(ptp_t *p)
+{
+    uint8_t st[16];
+    if (p->op || p->bulk != usb_bulk)
+        return NULL;
+    if (libusb_control_transfer(p->ctx, 0xA1, 0x67, 0, 0, st, sizeof st, 1000) >= 4 && rd16(st + 2) == RC_BUSY)
+        return "the camera reports itself busy over USB; switch it off and on again (or unplug it)";
+    return NULL;
 }
 
 ptp_t *eos_open(void)
