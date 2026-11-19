@@ -295,6 +295,19 @@ static void report(const char *what, int err)
         fprintf(stderr, "marksman-cam: camera held by another program (gvfs, gphoto2, camera maker software) or no permission (see README)\n");
 }
 
+/* A session cut off mid-transaction (USB glitch, another device enumerating on the same hub, the
+   service restarting) leaves its reply queued on the IN endpoint, and the camera then refuses every
+   new command (the first bulk OUT times out) until that is read. Read it away before the first command;
+   without this only a power cycle brought the camera back. Costs one short timeout on a clean camera. */
+static void drain(ptp_t *p)
+{
+    int got, n = 0;
+    while (n < 64 && !libusb_bulk_transfer(p->ctx, p->ep_in, p->buf, PTP_BUF, &got, 200))
+        n++;
+    if (n && debug())
+        fprintf(stderr, "ptp: discarded %d stale transfer(s) from an earlier session\n", n);
+}
+
 static ptp_t *try_device(libusb_device *dev)
 {
     struct libusb_device_descriptor dd;
@@ -345,6 +358,7 @@ static ptp_t *try_device(libusb_device *dev)
         p->ep_in = in;
         p->ep_out = out;
         p->sony = dd.idVendor == SONY_VID;
+        drain(p);
     }
     libusb_free_config_descriptor(cfg);
     return p;

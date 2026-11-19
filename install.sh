@@ -226,7 +226,8 @@ build_and_install() {
 # --- v4l2loopback devices ----------------------------------------------------------------------
 setup_loopback() {
     local labels nrs excl conf other
-    labels=$(printf '"%s",' "${LABELS[@]}"); labels=${labels%,}
+    # one quoted list: the kernel strips only the outer quotes, so "A","B" would leave stray quotes in the labels
+    labels=$(IFS=,; echo "\"${LABELS[*]}\"")
     nrs=$(IFS=,; echo "${NRS[*]}")
     excl=$(printf '1,%.0s' "${NRS[@]}"); excl=${excl%,}
     conf="options v4l2loopback devices=${#NRS[@]} video_nr=$nrs card_label=$labels exclusive_caps=$excl"

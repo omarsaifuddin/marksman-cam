@@ -43,6 +43,8 @@ Camera prep:
 - Close any other program using the camera (gphoto2, Canon or Sony software). Only one program can own it.
 
 ## Linux
+> **Known issue: on Linux only one camera works at a time.** With a Canon and a Sony both connected, you can pick either one, but when both are in use (e.g. two sources in OBS) one of them shows the grey frame. On Windows both cameras work at the same time. `--camera canon` or `--camera sony` with a single camera works.
+
 Works on any systemd distribution with v4l2loopback: Arch (and CachyOS, EndeavourOS, Manjaro), Debian/Ubuntu (and Mint, Pop!_OS), Fedora, openSUSE, Void. Run as your normal user; it asks for sudo where it needs root:
 ```sh
 ./install.sh                      # Canon and Sony, each its own virtual camera
@@ -137,3 +139,4 @@ Requires build 22000 or newer, which has `MFCreateVirtualCamera`.
 - Exposing camera controls (`IKsControl`, V4L2 controls) to apps.
 - 60 fps.
 - macOS.
+- Two cameras at once on Linux (see the known issue under Linux; Windows is fine).

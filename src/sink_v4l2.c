@@ -2,7 +2,7 @@
 
    Device choice mirrors the Windows virtual cameras: -d takes a path (/dev/video10) or a card label
    ("Marksman Cam (Sony)"). Without -d, the label for --camera is looked up ("Marksman Cam (Canon)",
-   "Marksman Cam (Sony)", "Marksman Cam"), then any "Marksman Cam" device, then /dev/video10.
+   "Marksman Cam (Sony)", "Marksman Cam"); with no --camera, then any "Marksman Cam" device, then /dev/video10.
 
    Demand: v4l2loopback >= 0.13 sends a client-usage event when a reader starts or stops streaming;
    the camera is woken only then, and released WATCH_GRACE_S after the last reader stops. Older modules
@@ -95,7 +95,14 @@ static int resolve(const char *device, char *path, size_t n)
         fprintf(stderr, "marksman-cam: no video device labelled \"%s\"\n", device);
         return 0;
     }
-    if (find_by_label(default_label(), 0, path, n) || find_by_label("Marksman Cam", 1, path, n))
+    if (find_by_label(default_label(), 0, path, n))
+        return 1;
+    if (eos_only_vid) {
+        /* never fall back to another camera's device: that service already feeds it */
+        fprintf(stderr, "marksman-cam: no video device labelled \"%s\"; run install.sh, or pass -d\n", default_label());
+        return 0;
+    }
+    if (find_by_label("Marksman Cam", 1, path, n))
         return 1;
     snprintf(path, n, "/dev/video10");
     return 1;
