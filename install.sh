@@ -158,11 +158,15 @@ install_deps() {
     [ $need_loop = 0 ] && say "v4l2loopback is already available for this kernel; not installing it"
     case $pm in
         pacman)
-            as_root pacman -S --needed --noconfirm base-devel cmake ninja pkgconf libusb libjpeg-turbo
+            # -S without -y: refreshing the database alone would be a partial upgrade, which Arch doesn't support
+            as_root pacman -S --needed --noconfirm base-devel cmake ninja pkgconf libusb libjpeg-turbo ||
+                die "pacman failed. A 404 from the mirror means the package database is out of date:
+       run 'sudo pacman -Syu', then ./install.sh again"
             if [ $need_loop = 1 ]; then
                 mapfile -t hdrs < <(arch_headers)
                 [ ${#hdrs[@]} -gt 0 ] || hdrs=(linux-headers)
-                as_root pacman -S --needed --noconfirm v4l2loopback-dkms "${hdrs[@]}"
+                as_root pacman -S --needed --noconfirm v4l2loopback-dkms "${hdrs[@]}" ||
+                    die "pacman failed; run 'sudo pacman -Syu', then ./install.sh again"
             fi ;;
         apt)
             as_root apt-get update
