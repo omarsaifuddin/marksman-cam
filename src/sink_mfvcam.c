@@ -36,12 +36,31 @@ enum { ACCESS_CURRENT_USER = 0, ACCESS_ALL_USERS = 1 };
 
 struct sink {
     IMFVirtualCamera *vcam;
-    HANDLE map;
+    HANDLE map, event;
     mcam_shm *shm;
     int w, h;
     LONG last_requests;
     ULONGLONG last_request_ms;
+    LONG ctl[MCAM_CTLS]; /* our picture controls, written into the section once it exists */
+    LONG ctl_seen;       /* ctl_seq as of our last read or write */
 };
+
+static void put_controls(sink_t *s)
+{
+    for (int i = 0; i < MCAM_CTLS; i++)
+        s->shm->ctl[i] = s->ctl[i];
+    s->shm->ctl_valid = 1;
+    s->ctl_seen = InterlockedIncrement(&s->shm->ctl_seq);
+}
+
+/* The section and event may only exist once the Frame Server has loaded the source. */
+static void attach(sink_t *s)
+{
+    if (!s->shm && (s->shm = mcam_shm_open(&s->map, slot())))
+        put_controls(s);
+    if (!s->event)
+        s->event = mcam_event_open(slot());
+}
 
 static HRESULT create_vcam(const char *name, int s, int lifetime, int access, IMFVirtualCamera **out)
 {
@@ -89,7 +108,9 @@ sink_t *sink_open_shared(int w, int h)
         return NULL;
     s->w = w;
     s->h = h;
-    s->shm = mcam_shm_open(&s->map, slot()); /* may only succeed once the Frame Server has created it */
+    for (int i = 0; i < MCAM_CTLS; i++)
+        s->ctl[i] = mcam_ctl_def[i];
+    attach(s);
     return s;
 }
 
@@ -116,8 +137,7 @@ sink_t *sink_open(const char *device, int w, int h, int fps)
 
 void sink_size(sink_t *s, int *w, int *h)
 {
-    if (!s->shm)
-        s->shm = mcam_shm_open(&s->map, slot());
+    attach(s);
     *w = s->w;
     *h = s->h;
     if (s->shm && s->shm->req_width > 0 && s->shm->req_width <= MCAM_MAX_W && s->shm->req_height > 0 &&
@@ -139,7 +159,7 @@ int sink_watched(sink_t *s)
     return s->last_request_ms && now - s->last_request_ms < WATCH_GRACE_MS;
 }
 
-int sink_write(sink_t *s, const uint8_t *bgrx, const view_t *v)
+int sink_write(sink_t *s, const yuv_t *f, const view_t *v)
 {
     mcam_shm *shm = s->shm;
     if (!shm)
@@ -151,11 +171,50 @@ int sink_write(sink_t *s, const uint8_t *bgrx, const view_t *v)
     InterlockedIncrement(&slot->seq); /* odd: slot in flux */
     slot->width = v->out_w;
     slot->height = v->out_h;
-    to_nv12(bgrx, v->out_w, v->out_h, v, shm->data[i]);
+    render_nv12(f, v, shm->data[i]);
     InterlockedIncrement(&slot->seq);
     InterlockedExchange(&shm->latest, i);
     InterlockedIncrement(&shm->frames);
+    InterlockedIncrement(&shm->alive);
+    if (s->event)
+        SetEvent(s->event); /* wake the source: it hands the picture over now, not on its next tick */
     return 0;
+}
+
+int sink_repeat(sink_t *s)
+{
+    if (s->shm)
+        InterlockedIncrement(&s->shm->alive); /* the source repeats the last picture by itself */
+    return 0;
+}
+
+static int *field(view_t *v, int i)
+{
+    return i == MCAM_BRIGHTNESS ? &v->brightness : i == MCAM_CONTRAST ? &v->contrast : i == MCAM_HUE ? &v->hue
+         : i == MCAM_SATURATION ? &v->saturation : &v->zoom;
+}
+
+int sink_controls(sink_t *s, view_t *v)
+{
+    if (!s->shm || !s->shm->ctl_valid || s->shm->ctl_seq == s->ctl_seen)
+        return 0;
+    s->ctl_seen = s->shm->ctl_seq;
+    for (int i = 0; i < MCAM_CTLS; i++) {
+        const LONG x = s->shm->ctl[i];
+        s->ctl[i] = x < mcam_ctl_min[i] ? mcam_ctl_min[i] : x > mcam_ctl_max[i] ? mcam_ctl_max[i] : x;
+        *field(v, i) = (int)s->ctl[i];
+    }
+    return 1;
+}
+
+void sink_set_controls(sink_t *s, const view_t *v)
+{
+    for (int i = 0; i < MCAM_CTLS; i++)
+        s->ctl[i] = *field((view_t *)v, i);
+    if (!s->ctl[MCAM_ZOOM])
+        s->ctl[MCAM_ZOOM] = 100;
+    if (s->shm)
+        put_controls(s);
 }
 
 void sink_close(sink_t *s)
@@ -172,5 +231,7 @@ void sink_close(sink_t *s)
         UnmapViewOfFile(s->shm);
     if (s->map)
         CloseHandle(s->map);
+    if (s->event)
+        CloseHandle(s->event);
     free(s);
 }

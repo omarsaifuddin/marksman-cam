@@ -20,7 +20,8 @@ static const GUID mcam_clsid[MCAM_SLOTS] = {
     {0x070E2FF7, 0xA837, 0x4A7C, {0x97, 0x1B, 0xD3, 0x47, 0x83, 0xA7, 0x7E, 0x35}},
     {0x19D3AC92, 0x2C41, 0x441E, {0xBD, 0xC9, 0xAB, 0x7A, 0x08, 0x42, 0xAF, 0x96}},
 };
-#define MCAM_SHM_NAME L"Global\\MarksmanCamFrame4-%d" /* + slot; bump the number whenever the layout changes */
+#define MCAM_SHM_NAME L"Global\\MarksmanCamFrame5-%d" /* + slot; bump the number whenever the layout changes */
+#define MCAM_EVENT_NAME L"Global\\MarksmanCamFresh5-%d" /* + slot; set by the app on every new picture */
 #define MCAM_SHM_SDDL L"D:P(A;;GA;;;SY)(A;;GA;;;LS)(A;;GA;;;BA)(A;;GA;;;IU)"
 #define MCAM_MAX_W 1920
 #define MCAM_MAX_H 1080
@@ -33,12 +34,23 @@ typedef struct {
 
 /* Double buffered: the app writes the slot that `latest` does not point at, then flips `latest`, so the
    source never reads a frame that is being written (a single buffer made it fall back to grey: flicker). */
+/* Picture controls an app can change through the camera's settings (IKsControl: VideoProcAmp brightness,
+   contrast, hue, saturation; CameraControl zoom). Both sides write ctl[] and bump ctl_seq. */
+enum { MCAM_BRIGHTNESS, MCAM_CONTRAST, MCAM_HUE, MCAM_SATURATION, MCAM_ZOOM, MCAM_CTLS };
+static const LONG mcam_ctl_min[MCAM_CTLS] = {-100, -100, -180, -100, 100};
+static const LONG mcam_ctl_max[MCAM_CTLS] = {100, 100, 180, 100, 400};
+static const LONG mcam_ctl_step[MCAM_CTLS] = {1, 1, 1, 1, 10};
+static const LONG mcam_ctl_def[MCAM_CTLS] = {0, 0, 0, 0, 100};
+
 typedef struct {
     volatile LONG latest;                /* slot holding the newest complete frame */
-    volatile LONG frames;                /* bumped per published frame; the source's "app alive" signal */
+    volatile LONG frames;                /* bumped per new picture */
+    volatile LONG alive;                 /* bumped by the app on every frame and repeat: it is still publishing */
     volatile LONG req_width, req_height; /* size the consuming app selected; written by the source */
     volatile LONG requests;              /* bumped by the source per frame request: someone is watching */
-    LONG reserved;
+    volatile LONG ctl_seq;               /* bumped by whichever side changed ctl[] */
+    volatile LONG ctl_valid;             /* ctl[] has been filled in */
+    volatile LONG ctl[MCAM_CTLS];
     mcam_slot slot[2];
     BYTE data[2][MCAM_MAX_W * MCAM_MAX_H * 3 / 2];
 } mcam_shm;
@@ -62,4 +74,20 @@ static inline mcam_shm *mcam_shm_open(HANDLE *map, int slot)
         *map = NULL;
     }
     return (mcam_shm *)view;
+}
+
+/* Auto-reset event the app sets after each new picture, so the source hands it over at once. */
+static inline HANDLE mcam_event_open(int slot)
+{
+    SECURITY_ATTRIBUTES sa = {sizeof sa, NULL, FALSE};
+    wchar_t name[64];
+    HANDLE h;
+    _snwprintf(name, 64, MCAM_EVENT_NAME, slot);
+    if ((h = OpenEventW(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE, name)))
+        return h;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(MCAM_SHM_SDDL, SDDL_REVISION_1, &sa.lpSecurityDescriptor, NULL))
+        return NULL;
+    h = CreateEventW(&sa, FALSE, FALSE, name);
+    LocalFree(sa.lpSecurityDescriptor);
+    return h;
 }

@@ -1,3 +1,4 @@
 1 24 "@CMAKE_CURRENT_SOURCE_DIR@/installer/setup.manifest"
 1 RCDATA "@CMAKE_BINARY_DIR@/marksman-cam.exe"
 2 RCDATA "@CMAKE_BINARY_DIR@/marksman-cam-vcam.dll"
+3 RCDATA "@CMAKE_CURRENT_SOURCE_DIR@/obs/marksman-cam.py"

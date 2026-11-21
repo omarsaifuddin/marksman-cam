@@ -12,17 +12,18 @@ find_package(PkgConfig REQUIRED)
 find_package(Threads REQUIRED)
 pkg_check_modules(DEPS REQUIRED libusb-1.0 libturbojpeg)
 
-add_library(camcore STATIC src/ptp.c src/image.c)
+add_library(camcore STATIC src/ptp.c src/image.c src/ctl.c)
 target_include_directories(camcore PUBLIC ${DEPS_INCLUDE_DIRS})
 if(WIN32)
   target_sources(camcore PRIVATE src/ptp_wpd.cpp)
-  target_link_libraries(camcore PUBLIC ole32 uuid)
+  target_link_libraries(camcore PUBLIC ole32 uuid ws2_32)
   # Fully static: nothing here may depend on the MSYS2 runtime DLLs.
   target_link_libraries(camcore PUBLIC ${DEPS_STATIC_LIBRARIES})
   target_link_directories(camcore PUBLIC ${DEPS_STATIC_LIBRARY_DIRS})
 else()
   target_link_libraries(camcore PUBLIC ${DEPS_LINK_LIBRARIES} m)
 endif()
+target_link_libraries(camcore PUBLIC Threads::Threads)
 
 if(WIN32)
   add_executable(marksman-cam src/main.c src/sink_mfvcam.c src/winsvc.c)
@@ -38,7 +39,7 @@ if(WIN32)
   # Double-click installer (no console): embeds the two binaries above and runs --install.
   configure_file(installer/setup.rc.in setup.rc @ONLY)
   set_source_files_properties(${CMAKE_BINARY_DIR}/setup.rc PROPERTIES OBJECT_DEPENDS
-    "${CMAKE_BINARY_DIR}/marksman-cam.exe;${CMAKE_BINARY_DIR}/marksman-cam-vcam.dll;${CMAKE_SOURCE_DIR}/installer/setup.manifest")
+    "${CMAKE_BINARY_DIR}/marksman-cam.exe;${CMAKE_BINARY_DIR}/marksman-cam-vcam.dll;${CMAKE_SOURCE_DIR}/installer/setup.manifest;${CMAKE_SOURCE_DIR}/obs/marksman-cam.py")
   add_executable(marksman-cam-setup WIN32 installer/setup.c ${CMAKE_BINARY_DIR}/setup.rc)
   add_dependencies(marksman-cam-setup marksman-cam marksman-cam-vcam)
   target_link_libraries(marksman-cam-setup advapi32 comctl32)
@@ -52,6 +53,7 @@ else()
   target_link_libraries(marksman-cam camcore Threads::Threads)
   include(GNUInstallDirs)
   install(TARGETS marksman-cam RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(FILES obs/marksman-cam.py DESTINATION ${CMAKE_INSTALL_DATADIR}/marksman-cam) # OBS: Tools > Scripts
 
   # systemd user unit template (one instance per camera) and the udev rule. install.sh copies the
   # rule into /etc/udev/rules.d; packagers can point UDEV_RULES_DIR at /usr/lib/udev/rules.d instead.

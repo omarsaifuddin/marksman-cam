@@ -145,6 +145,10 @@ static int install(void)
         return 1;
     }
 
+    /* The OBS controls script goes next to the program (OBS: Tools > Scripts > +). */
+    swprintf(cmd, 2 * MAX_PATH, L"%ls\\marksman-cam.py", dir);
+    extract(3, cmd);
+
     /* Keep a copy of this setup in the install folder: it is the uninstaller. */
     GetModuleFileNameW(NULL, self, MAX_PATH);
     if (_wcsicmp(self, setup))

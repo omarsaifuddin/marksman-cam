@@ -223,11 +223,28 @@ int sink_watched(sink_t *s)
     return s->readers || (s->last_reader && now - s->last_reader < WATCH_GRACE_S);
 }
 
-int sink_write(sink_t *s, const uint8_t *bgrx, const view_t *v)
+int sink_write(sink_t *s, const yuv_t *f, const view_t *v)
+{
+    render_yuyv(f, v, s->buf);
+    return sink_repeat(s);
+}
+
+int sink_repeat(sink_t *s)
 {
     const ssize_t n = (ssize_t)s->w * s->h * 2;
-    to_yuyv(bgrx, s->w, s->h, v, s->buf);
     return write(s->fd, s->buf, (size_t)n) == n ? 0 : -1;
+}
+
+/* v4l2loopback has no way to pass an app's control changes to the writer; the control port covers that. */
+int sink_controls(sink_t *s, view_t *v)
+{
+    (void)s, (void)v;
+    return 0;
+}
+
+void sink_set_controls(sink_t *s, const view_t *v)
+{
+    (void)s, (void)v;
 }
 
 void sink_close(sink_t *s)

@@ -6,6 +6,7 @@
 #include <portabledevice.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include <wchar.h>
 
 extern "C" {
@@ -156,25 +157,73 @@ static void wpd_release(ptp_t *p)
     d->Release();
 }
 
-extern "C" ptp_t *wpd_open(void)
+/* The USB serial number inside a device path: \\?\usb#vid_054c&pid_0d9f#<serial>#{interface guid}. */
+static void id_serial(const wchar_t *id, char *out, size_t n)
 {
-    IPortableDeviceManager *mgr = nullptr;
-    PWSTR *ids = nullptr;
-    DWORD n = 0;
-    ptp_t *p = nullptr;
+    const wchar_t *a = wcschr(id, L'#');
+    size_t i = 0;
+    if (a)
+        a = wcschr(a + 1, L'#');
+    if (a)
+        for (a++; a[i] && a[i] != L'#' && i + 1 < n; i++)
+            out[i] = (char)a[i];
+    out[i] = 0;
+}
 
+static int id_make(const wchar_t *id) /* 1 Canon, 2 Sony, 0 other */
+{
+    return _wcsnicmp(id, L"\\\\?\\usb#vid_04a9&", 17) == 0 ? 1 : _wcsnicmp(id, L"\\\\?\\usb#vid_054c&", 17) == 0 ? 2 : 0;
+}
+
+static PWSTR *device_ids(IPortableDeviceManager **mgr, DWORD *n)
+{
+    PWSTR *ids = nullptr;
+    *n = 0;
+    *mgr = nullptr;
     CoInitializeEx(nullptr, COINIT_MULTITHREADED); /* S_FALSE / RPC_E_CHANGED_MODE are fine */
     if (FAILED(CoCreateInstance(CLSID_PortableDeviceManager, nullptr, CLSCTX_INPROC_SERVER, IID_IPortableDeviceManager,
-                                (void **)&mgr)))
+                                (void **)mgr)))
         return nullptr;
-    mgr->RefreshDeviceList();
-    if (FAILED(mgr->GetDevices(nullptr, &n)) || !n || !(ids = (PWSTR *)calloc(n, sizeof *ids)) ||
-        FAILED(mgr->GetDevices(ids, &n)))
-        n = 0;
+    (*mgr)->RefreshDeviceList();
+    if (FAILED((*mgr)->GetDevices(nullptr, n)) || !*n || !(ids = (PWSTR *)calloc(*n, sizeof *ids)) ||
+        FAILED((*mgr)->GetDevices(ids, n)))
+        *n = 0;
+    return ids;
+}
+
+extern "C" void wpd_list(void)
+{
+    IPortableDeviceManager *mgr;
+    DWORD n;
+    PWSTR *ids = device_ids(&mgr, &n);
     for (DWORD i = 0; i < n; i++) {
-        int sony = _wcsnicmp(ids[i], L"\\\\?\\usb#vid_054c&", 17) == 0;
-        int canon = _wcsnicmp(ids[i], L"\\\\?\\usb#vid_04a9&", 17) == 0;
-        if (!p && ((sony && eos_only_vid != 0x04A9) || (canon && eos_only_vid != 0x054C))) {
+        if (const int make = id_make(ids[i])) {
+            wchar_t name[128] = L"";
+            DWORD len = 128;
+            char serial[128];
+            mgr->GetDeviceFriendlyName(ids[i], name, &len);
+            id_serial(ids[i], serial, sizeof serial);
+            printf("%-5s  %-38ls  --serial %s\n", make == 2 ? "sony" : "canon", name, serial);
+        }
+        CoTaskMemFree(ids[i]);
+    }
+    free(ids);
+    if (mgr)
+        mgr->Release();
+}
+
+extern "C" ptp_t *wpd_open(void)
+{
+    IPortableDeviceManager *mgr;
+    DWORD n;
+    PWSTR *ids = device_ids(&mgr, &n);
+    ptp_t *p = nullptr;
+
+    for (DWORD i = 0; i < n; i++) {
+        const int make = id_make(ids[i]), sony = make == 2, canon = make == 1;
+        char serial[128];
+        id_serial(ids[i], serial, sizeof serial);
+        if (!p && ((sony && eos_only_vid != 0x04A9) || (canon && eos_only_vid != 0x054C)) && eos_serial_ok(serial)) {
             IPortableDeviceValues *client = values();
             IPortableDevice *dev = nullptr;
             if (client) {
@@ -206,6 +255,7 @@ extern "C" ptp_t *wpd_open(void)
         CoTaskMemFree(ids[i]);
     }
     free(ids);
-    mgr->Release();
+    if (mgr)
+        mgr->Release();
     return p;
 }

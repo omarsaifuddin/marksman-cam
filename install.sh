@@ -118,7 +118,7 @@ uninstall() {
     stop_running
     say "Removing files"
     as_root rm -f "$PREFIX/bin/marksman-cam" "$PREFIX/lib/systemd/user/marksman-cam@.service" \
-        "$PREFIX/share/marksman-cam/70-marksman-cam.rules" "$MODPROBE_CONF" "$MODULES_CONF" "$UDEV_RULE"
+        "$PREFIX/share/marksman-cam/70-marksman-cam.rules" "$PREFIX/share/marksman-cam/marksman-cam.py"         "$MODPROBE_CONF" "$MODULES_CONF" "$UDEV_RULE"
     as_root rmdir "$PREFIX/share/marksman-cam" 2>/dev/null || true
     has_systemd && user_systemctl daemon-reload 2>/dev/null || true
     have udevadm && as_root udevadm control --reload || true
@@ -318,6 +318,8 @@ EOF
                                 (stop the service first: systemctl --user stop marksman-cam@${INSTANCES[0]})
   Logs:                         journalctl --user -u marksman-cam@${INSTANCES[0]} -f
   Options:                      ~/.config/marksman-cam/<camera>.conf, then systemctl --user restart marksman-cam@<camera>
+  Camera controls in OBS:       Tools > Scripts > + > $PREFIX/share/marksman-cam/marksman-cam.py
+  Camera controls by hand:      marksman-cam --camera ${INSTANCES[0]} --control list
   If the camera was plugged in during install, unplug and replug it once.
 EOF
 }

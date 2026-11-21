@@ -17,11 +17,16 @@ The picture is the camera's own live-view stream, read over PTP.
 ## Usage
 ```
 marksman-cam [-d DEV] [-s 1920x1080] [-r 30] [--fill] [--rotate 90] [--mirror] [--flip]
-          [--crop 0.1,0,0.9,1] [--brightness N] [--contrast N] [--saturation N] [--hue DEG]
-          [--set iso=0x48] [--set kelvin=5200] ...
+          [--crop 0.1,0,0.9,1] [--zoom 150] [--brightness N] [--contrast N] [--saturation N] [--hue DEG]
+          [--set iso=0x48] [--set kelvin=5200] [--af] [--camera canon|sony|any] [--serial SN]
+          [--stats] [--control-port N]
+marksman-cam --list                       # connected cameras and their serial numbers
+marksman-cam [--camera sony] --control "list" | "set iso 400" | "set af 1" | "set focus -2"
 ```
 - Start it and leave it running. It reconnects when the camera is unplugged, switched off, or restarted, and shows a grey frame while there is no camera.
-- `--set` values are Canon raw property codes (Canon only for now). Examples: iso `0x48`=100, `0x50`=200, `0x58`=400, `0x60`=800, `0x68`=1600, `0x00`=auto. Kelvin is plain Kelvin.
+- `--set` takes the camera's raw value; `--control list` shows every value the camera offers, with its label. Canon examples: iso `0x48`=100, `0x50`=200, `0x58`=400, `0x60`=800, `0x68`=1600, `0x00`=auto; kelvin is plain Kelvin. Sony: iso `400`, aperture `560` (= f/5.6).
+- `--serial` picks one camera when several of the same make are connected (`--list` shows the serials). `--af` autofocuses once each time the camera connects.
+- `--stats` prints, once a second, the camera's frame rate, how long each live-view transfer takes, and the output frame rate and render time. Use it to see where frames go.
 - On Windows the app using the camera picks 640x360, 1280x720 or 1920x1080, and marksman-cam renders at that size. On Linux the size is fixed by `-s` (default 1280x720).
 
 Tested under Windows 11 on an EOS Rebel T5i / 700D (live view 960x640) and a Sony a6400 in PC Remote mode (live view 1024x576 at a steady 20 fps over USB, through the stock Windows driver).
@@ -32,7 +37,9 @@ Tested under Windows 11 on an EOS Rebel T5i / 700D (live view 960x640) and a Son
 | Movie mode 1280x720@60, person in frame | 9.3 | The camera slows its USB to 3.5 MB/s (link 82% busy). **Don't use 60p** |
 | Stills mode, dim room | 7-10 | Live view slows itself down |
 
-**Use Movie mode at 1080p30.** The camera sets the frame rate, not marksman-cam; output stays at 30 fps by repeating frames. Poll spacing makes no difference.
+**Use Movie mode at 1080p30.** The camera sets the frame rate, not marksman-cam. Each frame goes out the moment it arrives; there is no 30 Hz output tick, which added up to a frame of latency and judder against the camera's 20 fps. The last frame is repeated only when the camera stalls. Poll spacing makes no difference.
+
+Per-frame CPU cost (decode + scale + colour, Ryzen 9800X3D, 1024x576 live view): 1080p NV12 4.3 ms, 720p 1.9 ms. The JPEG is decoded straight to its YUV planes and each output sample is read from them through precomputed bilinear taps, with no RGB step. The previous RGB path took 22 ms at 1080p, which slower CPUs could not fit in a frame.
 
 Live view over USB is the limit: above 20 fps on this body you need HDMI out into a capture dongle.
 
@@ -41,6 +48,19 @@ Camera prep:
 - Canon: use a shooting mode, Movie mode where available.
 - Sony (e.g. a6400): MENU > Setup > **USB Connection: PC Remote** (not Mass Storage/MTP). Any shooting mode.
 - Close any other program using the camera (gphoto2, Canon or Sony software). Only one program can own it.
+
+## Camera controls in apps and OBS
+Every running marksman-cam serves its controls on **127.0.0.1**: port 47811 Canon, 47812 Sony, 47810 any make (`--control-port` to change, `0` to turn off).
+- **Picture**: brightness, contrast, saturation, hue, digital zoom, mirror, flip, fill, rotate. Always available.
+- **Camera**, while an app is showing the camera (it is only woken then): autofocus, manual focus (nearer/farther in three step sizes), and every setting the camera reports with a list or range of values: ISO, shutter, aperture, exposure compensation, white balance, colour temperature, picture style, and on Sony anything else in its property list. Read-only ones (e.g. the mode dial) are shown greyed out.
+
+**OBS**: Tools > Scripts > + > `marksman-cam.py` (Windows: `C:\Program Files\marksman-cam\marksman-cam.py`; Linux: `/usr/local/share/marksman-cam/marksman-cam.py`; or `obs/` in this repo). Pick the camera, show its source, and press Refresh once the picture is up. On Windows, OBS needs Python 3 set in Tools > Scripts > Python Settings.
+
+**Windows apps**: brightness, contrast, hue, saturation and zoom are also standard camera controls (VideoProcAmp / CameraControl), for Settings > Bluetooth & devices > Cameras, OBS's "Configure Video", and other apps' camera settings.
+
+**Anything else**: one text line per connection, one reply. `list` returns JSON (`name`, `label`, `type` range/bool/menu/button/step/info, `value`, `min`/`max`/`step` or `options`); `set NAME VALUE` returns `ok` or `error: ...`. Values are checked against what the camera offers. Only the first line of a connection is read, so a web page posting to the port can't send commands.
+
+Changes made this way last until the service restarts; put them in the service options (`--set`, `--brightness`, ...) to keep them.
 
 ## Linux
 > **Known issue: on Linux only one camera works at a time.** With a Canon and a Sony both connected, you can pick either one, but when both are in use (e.g. two sources in OBS) one of them shows the grey frame. On Windows both cameras work at the same time. `--camera canon` or `--camera sony` with a single camera works.
@@ -73,6 +93,7 @@ systemctl --user stop marksman-cam@sony            # frees the camera; then chec
 marksman-cam --camera sony --snapshot sony.jpg
 ffplay /dev/video11                                # or open the camera in a browser
 ```
+- Two cameras of the same make: `--serial` (see `marksman-cam --list`) picks which one a service uses.
 - `-d` takes a path or a card label (`-d "Marksman Cam (Sony)"`). Without it marksman-cam finds the device labelled for `--camera`, so the `/dev/videoN` numbers don't matter. It refuses to write to anything that isn't a v4l2loopback device.
 - "camera held by another program": something opened it before the udev rule applied. Unplug and replug it, or `pkill -f gvfs-gphoto2-volume-monitor`.
 - "the camera reports itself busy over USB": the camera is stuck in an earlier session (for example from another computer). Switch it off and on.
@@ -106,6 +127,7 @@ Requires build 22000 or newer, which has `MFCreateVirtualCamera`.
    - With no camera plugged in, apps get a grey frame until one appears.
 
    Notes:
+   - **Upgrading** from a build without camera controls: run the setup (or `--install`) again for each camera. The service and the media source DLL share a new frame layout, so they must be the same version.
    - Options after `--install` become that camera's service settings (e.g. `--install --camera sony --mirror --fill`). Re-run it to change them or to upgrade; it stops all marksman-cam services and the Frame Server so the files can be replaced, then starts them again.
    - Quit any manually started marksman-cam.exe first.
    - `marksman-cam --uninstall --camera sony` removes that camera's service and virtual camera. `marksman-cam --uninstall` removes all of them and the registration. Then delete the folder.
@@ -120,23 +142,26 @@ Requires build 22000 or newer, which has `MFCreateVirtualCamera`.
 ## Layout
 | File | What |
 |---|---|
-| `src/ptp.c` | PTP over USB bulk, plus Canon EOS live view (remote mode, EVF output to PC, GetViewFinderData, keep-alive, properties) and Sony PC Remote live view (SDIO connect, live-view object 0xFFFFC002, property-poll keep-alive) |
+| `src/ptp.c` | PTP over USB bulk, plus Canon EOS live view (remote mode, EVF output to PC, GetViewFinderData, keep-alive, property events, autofocus, lens drive) and Sony PC Remote live view (SDIO connect, live-view object 0xFFFFC002, property block as keep-alive and property list, property set, half-press autofocus, focus drive); value labels |
 | `src/ptp_wpd.cpp` | Windows transport: the same PTP operations through the stock MTP driver |
-| `src/image.c` | JPEG decode, geometry (crop, rotate, mirror, fit/fill, bilinear scaling), picture controls, YUYV/NV12 |
+| `src/image.c` | JPEG decode to YUV planes, geometry (crop, zoom, rotate, mirror, fit/fill) as separable bilinear taps, picture controls, YUYV/NV12 |
+| `src/ctl.c` | Control port: picture and camera controls as JSON; `set` commands checked, then queued for the capture thread |
+| `obs/marksman-cam.py` | OBS script: builds its controls from the control port's `list` |
 | `src/sink_v4l2.c` | Linux output: v4l2loopback device by label, demand detection (client-usage events or /proc) |
 | `install.sh` | Linux installer: packages, build, v4l2loopback devices, udev rule, user services |
 | `linux/` | systemd user unit template and udev rule |
 | `src/sink_mfvcam.c` | Windows output: shared memory plus `MFCreateVirtualCamera` (system lifetime when installed, session lifetime when run by hand) |
 | `src/winsvc.c` | `--install` / `--uninstall` and the Windows service |
-| `win/vcam_source.cpp` | The COM media source the Frame Server loads (IMFActivate → IMFMediaSourceEx/IKsControl → IMFMediaStream2) |
+| `win/vcam_source.cpp` | The COM media source the Frame Server loads (IMFActivate → IMFMediaSourceEx/IKsControl → IMFMediaStream2); hands each new frame over as soon as marksman-cam signals it; VideoProcAmp/zoom controls |
 | `win/mcam_shm.h` | The shared-memory contract between the two |
-| `test/test_core.c` | Self-check (`ctest`): PTP framing over a fake USB pipe, live-view parsing, geometry, colour |
+| `test/test_core.c` | Self-check (`ctest`): PTP framing over a fake USB pipe, live-view parsing, Canon event and Sony property parsing, focus commands, value labels, control protocol, geometry, colour, a real JPEG decode |
 | `test/vcam_probe.c` | Windows end-to-end check |
 
 ## Not implemented yet
 - Scenes, multi-source compositing, overlays, background blur: use OBS on top of the Marksman Cam device.
 - Wi-Fi (PTP/IP).
-- Exposing camera controls (`IKsControl`, V4L2 controls) to apps.
+- Camera settings (ISO, shutter, ...) as standard controls inside apps. On Windows only the picture controls are; v4l2loopback can't pass control changes back to its writer at all. Use the OBS script or the control port.
+- Keeping control changes made at runtime.
 - 60 fps.
 - macOS.
 - Two cameras at once on Linux (see the known issue under Linux; Windows is fine).

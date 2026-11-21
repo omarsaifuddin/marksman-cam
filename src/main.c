@@ -4,13 +4,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
+#include "ctl.h"
 #include "image.h"
 #include "ptp.h"
 #include "sink.h"
 
 #ifdef _WIN32
 #include <windows.h>
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
 static double now_s(void)
 {
     LARGE_INTEGER f, c;
@@ -18,9 +23,21 @@ static double now_s(void)
     QueryPerformanceCounter(&c);
     return (double)c.QuadPart / (double)f.QuadPart;
 }
-static void sleep_s(double s) { Sleep((DWORD)(s * 1000)); }
+/* Sleep() rounds up to the 15.6 ms system tick, so every "not ready yet" from the camera cost up to a tick
+   of latency. A high-resolution waitable timer (Windows 10 1803+) sleeps for what was asked. */
+static void sleep_s(double s)
+{
+    static _Thread_local HANDLE t;
+    LARGE_INTEGER due;
+    if (!t)
+        t = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    due.QuadPart = -(LONGLONG)(s * 1e7);
+    if (t && SetWaitableTimer(t, &due, 0, NULL, NULL, FALSE))
+        WaitForSingleObject(t, INFINITE);
+    else
+        Sleep((DWORD)(s * 1000));
+}
 #else
-#include <time.h>
 static double now_s(void)
 {
     struct timespec t;
@@ -44,18 +61,27 @@ static const char usage[] =
     "                    \"Marksman Cam (Canon)\"/\"(Sony)\"/\"Marksman Cam\" for --camera, else /dev/video10);\n"
     "                    Windows: camera name (\"Marksman Cam\")\n"
     "  -s WxH            output size, even numbers (1280x720; on Windows the app using the camera picks)\n"
-    "  -r FPS            output frame rate (30)\n"
+    "  -r FPS            nominal frame rate (30). Frames go out as the camera delivers them; the last one is\n"
+    "                    repeated only when the camera stalls for 2.5 frame times\n"
     "  --fill            crop to fill the frame instead of letterboxing\n"
     "  --rotate DEG      0, 90, 180 or 270 clockwise\n"
     "  --mirror          flip left-right       --flip   flip upside down\n"
     "  --crop X0,Y0,X1,Y1  source region as fractions, e.g. 0.1,0,0.9,1\n"
+    "  --zoom PCT        digital zoom, 100..400\n"
     "  --brightness N  --contrast N  --saturation N   -100..100\n"
     "  --hue DEG\n"
     "  --set NAME=VALUE  camera property once connected; NAME is av tv iso ec wb kelvin style or a hex\n"
-    "                    property code; VALUE is the Canon raw code (iso 0x48=100 .. 0x70=3200), kelvin in K\n"
+    "                    property code; VALUE is the camera's raw value (marksman-cam --control list shows them)\n"
+    "  --af              autofocus once each time the camera connects\n"
     "  --camera canon|sony|any  use only that make (default any); put it first. On Windows each choice is\n"
     "                    its own virtual camera: \"Marksman Cam (Canon)\", \"Marksman Cam (Sony)\", \"Marksman Cam\"\n"
+    "  --serial SN       use only the camera with this USB serial number (see --list)\n"
+    "  --list            list connected cameras with their serial numbers and exit\n"
     "  --snapshot FILE   save one live-view JPEG and exit (camera check, no virtual camera needed)\n"
+    "  --control-port N  control port for the OBS script and --control (default 47810 + 0 any, 1 Canon,\n"
+    "                    2 Sony; 0 = off). Listens on 127.0.0.1 only\n"
+    "  --control CMD     send CMD (\"list\", \"set iso 400\", \"set af 1\") to a running marksman-cam and exit\n"
+    "  --stats           print camera and output frame rates once a second\n"
 #ifdef _WIN32
     "  --install [opts]  (admin) permanent virtual camera + background service for --camera; opts become its\n"
     "                    settings. Run once per camera to have several, e.g. --camera canon, then --camera sony\n"
@@ -74,8 +100,6 @@ static int snapshot(const char *path)
 {
     const uint8_t *jpeg = NULL;
     uint32_t len = 0;
-    uint8_t *rgb = NULL;
-    size_t cap = 0;
     int r = 0, w = 0, h = 0, rc;
     ptp_t *cam = eos_open();
     FILE *f;
@@ -96,13 +120,12 @@ static int snapshot(const char *path)
     if (r > 0 && (f = fopen(path, "wb"))) {
         fwrite(jpeg, 1, len, f);
         fclose(f);
-        jpeg_decode(jpeg, len, &rgb, &cap, &w, &h);
+        jpeg_size(jpeg, len, &w, &h);
         printf("wrote %s: %dx%d live view, %u bytes\n", path, w, h, (unsigned)len);
     } else {
         fprintf(stderr, "marksman-cam: %s\n", r < 0 ? "camera error" : r ? path : "no frame within 5 s");
     }
     eos_close(cam);
-    free(rgb);
     return r > 0 ? 0 : 1;
 }
 
@@ -115,19 +138,22 @@ static void on_signal(int sig)
     stop = 1;
 }
 
-/* Newest live-view JPEG, handed from the capture thread to the main loop. */
+/* Newest live-view JPEG, handed from the capture thread to the main loop, plus per-second camera stats. */
 static struct {
     pthread_mutex_t lock;
+    pthread_cond_t fresh; /* signalled on every new frame and on connect/disconnect */
     uint8_t *jpeg;
     uint32_t len, cap;
-    unsigned seq;  /* bumped on every new frame and on connect/disconnect */
+    unsigned seq;
     int connected;
-} latest = {PTHREAD_MUTEX_INITIALIZER, NULL, 0, 0, 0, 0};
+    unsigned frames, not_ready; /* since the last --stats line */
+    double op_s;                /* time spent in frame transfers */
+} latest = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, NULL, 0, 0, 0, 0, 0, 0, 0};
 
 static const char *sets[MAX_SETS];
-static int nsets;
+static int nsets, af_on_connect, stats;
 
-static void publish(const uint8_t *jpeg, uint32_t len, int connected)
+static void publish(const uint8_t *jpeg, uint32_t len, int connected, double op_s)
 {
     pthread_mutex_lock(&latest.lock);
     if (jpeg && len > latest.cap) {
@@ -140,28 +166,35 @@ static void publish(const uint8_t *jpeg, uint32_t len, int connected)
     if (jpeg && len <= latest.cap) {
         memcpy(latest.jpeg, jpeg, len);
         latest.len = len;
+        latest.frames++;
+        latest.op_s += op_s;
     }
     latest.connected = connected;
     latest.seq++;
+    pthread_cond_signal(&latest.fresh);
     pthread_mutex_unlock(&latest.lock);
 }
 
 static void apply_settings(ptp_t *cam)
 {
+    if (cam->sony && nsets)
+        eos_poll(cam); /* Sony needs each property's datatype, from its property block, before a set */
     for (int i = 0; i < nsets; i++) {
         char name[32];
         long prop;
         int rc;
         sscanf(sets[i], "%31[^=]", name);
-        prop = eos_setting(name) >= 0 ? eos_setting(name) : strtol(name, NULL, 16);
-        if ((rc = eos_set_prop(cam, (uint32_t)prop, (uint32_t)strtoul(strchr(sets[i], '=') + 1, NULL, 0))) != PTP_OK)
+        if ((prop = eos_setting(cam->sony, name)) < 0)
+            fprintf(stderr, "marksman-cam: --set %s: unknown property\n", sets[i]);
+        else if ((rc = eos_set_prop(cam, (uint32_t)prop, strtoll(strchr(sets[i], '=') + 1, NULL, 0))) != PTP_OK)
             fprintf(stderr, "marksman-cam: --set %s rejected (0x%04x)\n", sets[i], rc);
     }
 }
 
 /* Owns the camera and pulls frames back to back, so the USB side never waits for decoding or output:
    done serially on one thread, a 700D's 20 fps live view came out at 16. Live view runs only while
-   `watched`; otherwise the camera is left alone (asleep, or free for other software). */
+   `watched`; otherwise the camera is left alone (asleep, or free for other software). Commands from the
+   control port run here too, between frames, since PTP allows one operation at a time. */
 static void *capture(void *arg)
 {
     (void)arg;
@@ -177,7 +210,7 @@ static void *capture(void *arg)
         if (!cam) {
             if (!waiting_said++)
                 fprintf(stderr, "marksman-cam: an app wants the webcam; waiting for a camera on USB\n");
-            sleep_s(2);
+            eos_wait_device(2);
             continue;
         }
         waiting_said = 0;
@@ -190,76 +223,111 @@ static void *capture(void *arg)
         }
         fprintf(stderr, "marksman-cam: camera connected\n");
         apply_settings(cam);
+        if (af_on_connect && (rc = eos_autofocus(cam)) != PTP_OK)
+            fprintf(stderr, "marksman-cam: --af rejected (0x%04x)\n", rc);
         for (;;) {
             const uint8_t *jpeg;
             uint32_t len;
+            const double t0 = now_s();
             int r = stop || !watched ? -1 : eos_frame(cam, &jpeg, &len);
-            if (r > 0)
-                publish(jpeg, len, 1);
-            else if (r == 0)
+            if (r > 0) {
+                publish(jpeg, len, 1, now_s() - t0);
+            } else if (r == 0) {
+                latest.not_ready++; /* ponytail: unlocked counter, only for --stats */
                 sleep_s(0.002); /* "not ready" is cheap and the camera sets the pace: poll gap made no difference */
+            }
             if (r >= 0 && now_s() - last_poll > 1) {
                 last_poll = now_s();
                 r = eos_poll(cam) < 0 ? -1 : r;
             }
             if (r < 0)
                 break;
+            ctl_camera(cam);
         }
         if (!stop)
             fprintf(stderr, watched ? "marksman-cam: camera disconnected\n" : "marksman-cam: no app watching, camera idle\n");
         eos_close(cam);
-        publish(NULL, 0, 0);
+        ctl_camera(NULL);
+        publish(NULL, 0, 0, 0);
     }
     return NULL;
 }
 
-static view_t v = {1280, 720, 0, 0, 0, 0, {0, 0, 1, 1}, 0, 0, 0, 0};
-static int fps = 30;
+static view_t v = {1280, 720, 0, 0, 0, 0, {0, 0, 1, 1}, 0, 0, 0, 0, 0};
+static int fps = 30, ctl_port = -1;
 
 static int run(sink_t *sink)
 {
-    uint8_t *canvas = malloc((size_t)MAX_W * MAX_H * 4), *rgb = NULL, *jpeg = NULL;
-    size_t rgb_cap = 0, jpeg_cap = 0;
+    yuv_t frame = {0};
+    uint8_t *jpeg = NULL;
+    size_t jpeg_cap = 0;
     uint32_t jpeg_len = 0;
-    unsigned seen = 0;
-    int sw = 0, sh = 0, have = 0, dirty = 1, last_w = 0, last_h = 0;
-    double next = now_s(), t, idle_write = 0;
-    int idle_ready = 0;
-    (void)idle_write; /* Linux only */
+    unsigned seen = 0, out_frames = 0;
+    int have = 0, dirty = 1, last_w = 0, last_h = 0;
+    double last_write = 0, idle_write = 0, stats_at = now_s(), render_s = 0;
     pthread_t thread;
 
-    if (!sink || !canvas || pthread_create(&thread, NULL, capture, NULL))
+    if (!sink || pthread_create(&thread, NULL, capture, NULL))
         return 1;
+    ctl_set_view(&v);
+    sink_set_controls(sink, &v);
+    if (ctl_port > 0 && ctl_start(ctl_port))
+        fprintf(stderr, "marksman-cam: control port %d is in use; camera controls are off\n", ctl_port);
+    else if (ctl_port > 0)
+        fprintf(stderr, "marksman-cam: controls on 127.0.0.1:%d (OBS script, or marksman-cam --control list)\n", ctl_port);
     fprintf(stderr, "marksman-cam: ready; the camera is woken when an app opens the webcam\n");
 
     while (!stop) {
         int fresh = 0;
+        double t;
         sink_size(sink, &v.out_w, &v.out_h);
+        if (ctl_take_view(&v)) {
+            sink_set_controls(sink, &v);
+            dirty = 1;
+        }
+        if (sink_controls(sink, &v)) {
+            ctl_set_view(&v);
+            dirty = 1;
+        }
+        if (v.out_w != last_w || v.out_h != last_h) {
+            last_w = v.out_w;
+            last_h = v.out_h;
+            dirty = 1;
+        }
         if (!(watched = sink_watched(sink))) {
 #ifndef _WIN32
             /* v4l2loopback with exclusive_caps=1 only lists the device as a camera while its writer
                produces frames, so keep a cheap idle frame going: 2 fps, no camera traffic. */
             if (now_s() - idle_write >= 0.5) {
                 idle_write = now_s();
-                if (v.out_w != last_w || v.out_h != last_h || !idle_ready) {
-                    status_frame(canvas, v.out_w, v.out_h);
-                    last_w = v.out_w;
-                    last_h = v.out_h;
-                    idle_ready = 1;
-                    dirty = 1; /* repaint the camera picture once someone watches again */
-                }
-                if (sink_write(sink, canvas, &v)) {
+                if (dirty ? sink_write(sink, NULL, &v) : sink_repeat(sink)) {
                     perror("marksman-cam: writing frame");
                     break;
                 }
+                dirty = 0;
+                have = 0;
             }
+#else
+            dirty = 1; /* show the camera picture (or "no camera") as soon as someone watches again */
+            have = 0;
 #endif
+            (void)idle_write;
             sleep_s(0.1); /* nobody watching: no camera traffic, no rendering */
-            next = now_s();
             continue;
         }
-        idle_ready = 0;
+
+        /* Wait for the next camera frame; at most 50 ms, so control changes and the watch state stay live. */
         pthread_mutex_lock(&latest.lock);
+        if (latest.seq == seen && !dirty) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_nsec += 50000000;
+            if (ts.tv_nsec >= 1000000000) {
+                ts.tv_sec++;
+                ts.tv_nsec -= 1000000000;
+            }
+            pthread_cond_timedwait(&latest.fresh, &latest.lock, &ts);
+        }
         if (latest.seq != seen) {
             seen = latest.seq;
             if (!latest.connected) {
@@ -281,39 +349,47 @@ static int run(sink_t *sink)
             }
         }
         pthread_mutex_unlock(&latest.lock);
-        if (fresh && !jpeg_decode(jpeg, jpeg_len, &rgb, &rgb_cap, &sw, &sh))
+        if (fresh && !jpeg_decode(jpeg, jpeg_len, &frame))
             have = dirty = 1;
 
-        if (v.out_w != last_w || v.out_h != last_h) {
-            last_w = v.out_w;
-            last_h = v.out_h;
-            dirty = 1;
-        }
-        if (dirty) {
-            if (have)
-                render(rgb, sw, sh, &v, canvas);
-            else
-                status_frame(canvas, v.out_w, v.out_h);
+        t = now_s();
+        if (dirty) { /* new picture or new settings: render once, straight into the output */
+            if (sink_write(sink, have ? &frame : NULL, &v)) {
+                perror("marksman-cam: writing frame");
+                break;
+            }
+            last_write = now_s();
+            render_s += last_write - t;
+            out_frames++;
             dirty = 0;
-        }
-        if (sink_write(sink, canvas, &v)) {
-            perror("marksman-cam: writing frame");
-            break;
+        } else if (t - last_write >= 2.5 / fps) { /* camera stalled: keep the stream alive */
+            if (sink_repeat(sink)) {
+                perror("marksman-cam: writing frame");
+                break;
+            }
+            last_write = t;
         }
 
-        next += 1.0 / fps;
-        t = now_s();
-        if (next > t)
-            sleep_s(next - t);
-        else
-            next = t; /* fell behind: don't try to catch up */
+        if (stats && t - stats_at >= 1) {
+            const double dt = t - stats_at;
+            pthread_mutex_lock(&latest.lock);
+            fprintf(stderr, "marksman-cam: camera %.1f fps (%.1f ms per frame transfer, %u not-ready polls) -> "
+                            "out %.1f fps (%.1f ms render) at %dx%d\n",
+                    latest.frames / dt, latest.frames ? latest.op_s / latest.frames * 1e3 : 0, latest.not_ready,
+                    out_frames / dt, out_frames ? render_s / out_frames * 1e3 : 0, v.out_w, v.out_h);
+            latest.frames = latest.not_ready = 0;
+            latest.op_s = 0;
+            pthread_mutex_unlock(&latest.lock);
+            out_frames = 0;
+            render_s = 0;
+            stats_at = t;
+        }
     }
 
     stop = 1;
     pthread_join(thread, NULL); /* closes the camera cleanly */
     sink_close(sink);
-    free(canvas);
-    free(rgb);
+    free(frame.buf);
     free(jpeg);
     return 0;
 }
@@ -327,8 +403,8 @@ static int run_service(void)
 
 int main(int argc, char **argv)
 {
-    const char *device = NULL;
-    int install = 0, uninstall = 0, service = 0, camera_given = 0;
+    const char *device = NULL, *control = NULL, *snap = NULL;
+    int install = 0, uninstall = 0, service = 0, camera_given = 0, list = 0;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i], *val = i + 1 < argc ? argv[i + 1] : NULL;
@@ -339,6 +415,12 @@ int main(int argc, char **argv)
             v.mirror = 1, used = 0;
         else if (!strcmp(a, "--flip"))
             v.flip = 1, used = 0;
+        else if (!strcmp(a, "--af"))
+            af_on_connect = 1, used = 0;
+        else if (!strcmp(a, "--stats"))
+            stats = 1, used = 0;
+        else if (!strcmp(a, "--list"))
+            list = 1, used = 0;
         else if (!strcmp(a, "--install"))
             install = 1, used = 0;
         else if (!strcmp(a, "--uninstall"))
@@ -364,6 +446,9 @@ int main(int argc, char **argv)
             if (sscanf(val, "%f,%f,%f,%f", &c[0], &c[1], &c[2], &c[3]) != 4 || c[0] < 0 || c[1] < 0 ||
                 c[2] > 1 || c[3] > 1 || c[2] - c[0] < 0.01f || c[3] - c[1] < 0.01f)
                 goto bad;
+        } else if (!strcmp(a, "--zoom")) {
+            if ((v.zoom = atoi(val)) < 100 || v.zoom > 400)
+                goto bad;
         } else if (!strcmp(a, "--brightness"))
             v.brightness = atoi(val);
         else if (!strcmp(a, "--contrast"))
@@ -384,12 +469,29 @@ int main(int argc, char **argv)
                 eos_only_vid = 0;
             else
                 goto bad;
-        } else if (!strcmp(a, "--snapshot"))
-            return snapshot(val);
+        } else if (!strcmp(a, "--serial"))
+            eos_only_serial = val;
+        else if (!strcmp(a, "--control-port")) {
+            if ((ctl_port = atoi(val)) < 0 || ctl_port > 65535)
+                goto bad;
+        } else if (!strcmp(a, "--control"))
+            control = val;
+        else if (!strcmp(a, "--snapshot"))
+            snap = val;
         else
             goto bad;
         i += used;
     }
+    if (ctl_port < 0)
+        ctl_port = CTL_PORT_BASE + (eos_only_vid == 0x04A9 ? 1 : eos_only_vid == 0x054C ? 2 : 0);
+    if (list) {
+        eos_list();
+        return 0;
+    }
+    if (snap)
+        return snapshot(snap);
+    if (control)
+        return ctl_client(ctl_port, control);
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);

@@ -37,11 +37,109 @@ struct IMFMediaStream2_ : IMFMediaStream {
 static const UINT32 kSizes[][2] = {{1280, 720}, {1920, 1080}, {640, 360}};
 static const UINT32 kFps = 30;
 static const LONGLONG kFrame = 10000000 / kFps; /* 100 ns units */
-static const LONGLONG kStale = 20000000;        /* app gone if no new frame for 2 s */
+static const LONGLONG kMaxWait = 2 * kFrame;    /* repeat the last picture if no new one comes in this long */
+static const LONGLONG kStale = 20000000;        /* app gone if it hasn't published for 2 s */
 static LONG g_objects;
 static HMODULE g_module;
 
-#define KS_NOT_FOUND HRESULT_FROM_WIN32(ERROR_SET_NOT_FOUND) /* we expose no camera controls */
+#define KS_NOT_FOUND HRESULT_FROM_WIN32(ERROR_SET_NOT_FOUND)
+
+/* ---- picture controls apps can set (camera settings in Windows, "Configure Video" in OBS, ...) ----
+   Layouts and values from ks.h / ksmedia.h, which MinGW lacks in user-mode form. */
+static const GUID kVideoProcAmp  = {0xC6E13360, 0x30AC, 0x11D0, {0xA1, 0x8C, 0x00, 0xA0, 0xC9, 0x11, 0x89, 0x56}};
+static const GUID kCameraControl = {0xC6E13370, 0x30AC, 0x11D0, {0xA1, 0x8C, 0x00, 0xA0, 0xC9, 0x11, 0x89, 0x56}};
+static const GUID kPropTypeGeneral = {0x97E99BA0, 0xBDEA, 0x11CF, {0xA5, 0xD6, 0x28, 0xDB, 0x04, 0xC1, 0x00, 0x00}};
+enum : ULONG {
+    KS_GET = 0x1, KS_SET = 0x2, KS_BASICSUPPORT = 0x200, KS_DEFAULTVALUES = 0x1000, KS_TOPOLOGY = 0x10000000,
+    KS_MEMBER_STEPPEDRANGES = 2, KS_MEMBER_VALUES = 3, KS_MEMBER_FLAG_DEFAULT = 1, KS_FLAGS_MANUAL = 2,
+};
+struct KsId { GUID set; ULONG id, flags; };                  /* KSPROPERTY */
+struct KsLongProp { KsId p; LONG value; ULONG flags, caps; }; /* KSPROPERTY_VIDEOPROCAMP_S / _CAMERACONTROL_S */
+struct KsDesc { ULONG access, size; KsId type; ULONG members, reserved; }; /* KSPROPERTY_DESCRIPTION */
+struct KsMembers { ULONG flags, size, count, mflags; };                   /* KSPROPERTY_MEMBERSHEADER */
+struct KsStepping { ULONG delta, reserved; LONG min, max; };             /* KSPROPERTY_STEPPING_LONG */
+
+static int ks_control(const GUID &set, ULONG id)
+{
+    if (set == kVideoProcAmp && id <= 3) /* brightness, contrast, hue, saturation: same order as MCAM_* */
+        return (int)id;
+    if (set == kCameraControl && id == 3) /* zoom */
+        return MCAM_ZOOM;
+    return -1;
+}
+
+static HRESULT ks_property(mcam_shm *shm, PKSPROPERTY prop, ULONG plen, LPVOID data, ULONG dlen, ULONG *ret)
+{
+    const KsId *p = (const KsId *)prop;
+    if (!p || plen < sizeof(KsId) || !ret)
+        return E_INVALIDARG;
+    const int c = ks_control(p->set, p->id);
+    const ULONG type = p->flags & ~(ULONG)KS_TOPOLOGY;
+    if (c < 0)
+        return KS_NOT_FOUND;
+    *ret = 0;
+
+    if (type & (KS_BASICSUPPORT | KS_DEFAULTVALUES)) {
+        const bool basic = type & KS_BASICSUPPORT;
+        const ULONG need = sizeof(KsDesc) + sizeof(KsMembers) + (basic ? sizeof(KsStepping) : sizeof(LONG));
+        if (!dlen) {
+            *ret = need;
+            return HRESULT_FROM_WIN32(ERROR_MORE_DATA);
+        }
+        if (dlen == sizeof(ULONG)) { /* access flags only */
+            *(ULONG *)data = KS_GET | KS_SET | KS_BASICSUPPORT | KS_DEFAULTVALUES;
+            *ret = sizeof(ULONG);
+            return S_OK;
+        }
+        if (dlen < sizeof(KsDesc))
+            return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+        KsDesc *d = (KsDesc *)data;
+        d->access = KS_GET | KS_SET | KS_BASICSUPPORT | KS_DEFAULTVALUES;
+        d->size = need;
+        d->type = {kPropTypeGeneral, VT_I4, 0};
+        d->members = 1;
+        d->reserved = 0;
+        *ret = sizeof(KsDesc);
+        if (dlen >= need) {
+            KsMembers *m = (KsMembers *)(d + 1);
+            if (basic) {
+                *m = {KS_MEMBER_STEPPEDRANGES, sizeof(KsStepping), 1, 0};
+                *(KsStepping *)(m + 1) = {(ULONG)mcam_ctl_step[c], 0, mcam_ctl_min[c], mcam_ctl_max[c]};
+            } else {
+                *m = {KS_MEMBER_VALUES, sizeof(LONG), 1, KS_MEMBER_FLAG_DEFAULT};
+                *(LONG *)(m + 1) = mcam_ctl_def[c];
+            }
+            *ret = need;
+        }
+        return S_OK;
+    }
+    if (dlen < sizeof(KsLongProp)) {
+        *ret = sizeof(KsLongProp);
+        return HRESULT_FROM_WIN32(dlen ? ERROR_INSUFFICIENT_BUFFER : ERROR_MORE_DATA);
+    }
+    KsLongProp *v = (KsLongProp *)data;
+    if (type & KS_GET) {
+        v->value = shm && shm->ctl_valid ? shm->ctl[c] : mcam_ctl_def[c];
+        v->flags = v->caps = KS_FLAGS_MANUAL;
+        *ret = sizeof(KsLongProp);
+        return S_OK;
+    }
+    if (type & KS_SET) {
+        if (v->value < mcam_ctl_min[c] || v->value > mcam_ctl_max[c])
+            return E_INVALIDARG;
+        if (!shm)
+            return HRESULT_FROM_WIN32(ERROR_NOT_READY);
+        if (!shm->ctl_valid) {
+            for (int i = 0; i < MCAM_CTLS; i++)
+                shm->ctl[i] = mcam_ctl_def[i];
+            shm->ctl_valid = 1;
+        }
+        shm->ctl[c] = v->value;
+        InterlockedIncrement(&shm->ctl_seq); /* marksman-cam picks it up on its next frame */
+        return S_OK;
+    }
+    return KS_NOT_FOUND;
+}
 
 class Source;
 
@@ -110,7 +208,15 @@ public:
         return S_OK;
     }
 
-    STDMETHODIMP KsProperty(PKSPROPERTY, ULONG, LPVOID, ULONG, ULONG *) override { return KS_NOT_FOUND; }
+    STDMETHODIMP KsProperty(PKSPROPERTY p, ULONG plen, LPVOID d, ULONG dlen, ULONG *ret) override
+    {
+        AcquireSRWLockExclusive(&lock_);
+        if (!shm_)
+            shm_ = mcam_shm_open(&map_, slot_);
+        HRESULT hr = ks_property(shm_, p, plen, d, dlen, ret);
+        ReleaseSRWLockExclusive(&lock_);
+        return hr;
+    }
     STDMETHODIMP KsMethod(PKSMETHOD, ULONG, LPVOID, ULONG, ULONG *) override { return KS_NOT_FOUND; }
     STDMETHODIMP KsEvent(PKSEVENT, ULONG, LPVOID, ULONG, ULONG *) override { return KS_NOT_FOUND; }
 
@@ -119,7 +225,6 @@ public:
         AcquireSRWLockExclusive(&lock_);
         w_ = w;
         h_ = h;
-        next_ = 0;
         state_ = MF_STREAM_STATE_RUNNING;
         ReleaseSRWLockExclusive(&lock_);
         return queue_->QueueEventParamVar(MEStreamStarted, GUID_NULL, S_OK, nullptr);
@@ -148,6 +253,8 @@ private:
             UnmapViewOfFile(shm_);
         if (map_)
             CloseHandle(map_);
+        if (event_)
+            CloseHandle(event_);
         free(last_);
         InterlockedDecrement(&g_objects);
     }
@@ -157,15 +264,11 @@ private:
     void Fill(BYTE *dst, UINT32 w, UINT32 h, LONGLONG now)
     {
         const size_t size = (size_t)w * h * 3 / 2;
-        if (!shm_)
-            shm_ = mcam_shm_open(&map_, slot_);
         if (shm_) {
-            shm_->req_width = (LONG)w;
-            shm_->req_height = (LONG)h;
-            InterlockedIncrement(&shm_->requests); /* the app only wakes the camera while this moves */
-            const LONG frames = shm_->frames;
-            if (frames != last_frames_) {
-                last_frames_ = frames;
+            const LONG alive = shm_->alive;
+            delivered_ = shm_->frames;
+            if (alive != last_alive_) {
+                last_alive_ = alive;
                 last_change_ = now;
             }
             if (now - last_change_ < kStale) {
@@ -204,9 +307,9 @@ private:
     MF_STREAM_STATE state_ = MF_STREAM_STATE_STOPPED;
     bool shutdown_ = false;
     UINT32 w_ = 0, h_ = 0;
-    LONGLONG next_ = 0, last_change_ = 0;
-    LONG last_frames_ = -1;
-    HANDLE map_ = nullptr;
+    LONGLONG last_change_ = 0;
+    LONG last_alive_ = -1, delivered_ = -1; /* shm alive / frames as of the last sample */
+    HANDLE map_ = nullptr, event_ = nullptr;
     mcam_shm *shm_ = nullptr;
     BYTE *last_ = nullptr; /* last good frame, repeated if a read is torn */
     UINT32 last_w_ = 0, last_h_ = 0;
@@ -226,15 +329,34 @@ HRESULT Stream::RequestSample(IUnknown *token)
     }
     const UINT32 w = w_, h = h_;
     const DWORD size = w * h * 3 / 2;
-    LONGLONG now = MFGetSystemTime();
-    const LONGLONG wait = next_ - now;
-    next_ = (wait > 0 ? next_ : now) + kFrame;
+    if (!shm_)
+        shm_ = mcam_shm_open(&map_, slot_);
+    if (!event_)
+        event_ = mcam_event_open(slot_);
+    mcam_shm *const shm = shm_;
+    const HANDLE fresh = event_;
+    const LONG delivered = delivered_;
+    if (shm) {
+        shm->req_width = (LONG)w;
+        shm->req_height = (LONG)h;
+        InterlockedIncrement(&shm->requests); /* the app only wakes the camera while this moves */
+    }
     ReleaseSRWLockExclusive(&lock_);
 
-    /* ponytail: paces by sleeping on the caller's thread (at most one frame); use MFScheduleWorkItem if that
-       ever starves the pipeline. */
-    if (wait > 0)
-        Sleep((DWORD)(wait / 10000));
+    /* Paced by the camera, not a clock: hand each new picture over as soon as marksman-cam publishes it
+       (it sets `fresh`), and repeat the last one if none comes within kMaxWait. A fixed 30 Hz tick here
+       added up to a frame of latency and, beating against the camera's own rate, dropped or doubled frames.
+       ponytail: waits on the caller's thread (at most kMaxWait); use MFScheduleWorkItem if that ever starves
+       the pipeline. */
+    LONGLONG now = MFGetSystemTime();
+    const LONGLONG deadline = now + kMaxWait;
+    while (now < deadline && (!shm || shm->frames == delivered)) { /* no section yet: grey, still paced */
+        if (fresh && shm)
+            WaitForSingleObject(fresh, (DWORD)((deadline - now) / 10000) + 1);
+        else
+            Sleep(2);
+        now = MFGetSystemTime();
+    }
 
     hr = MFCreateMemoryBuffer(size, &buf);
     if (SUCCEEDED(hr))
@@ -476,7 +598,15 @@ public:
         return MF_E_UNSUPPORTED_SERVICE;
     }
 
-    STDMETHODIMP KsProperty(PKSPROPERTY, ULONG, LPVOID, ULONG, ULONG *) override { return KS_NOT_FOUND; }
+    STDMETHODIMP KsProperty(PKSPROPERTY p, ULONG plen, LPVOID d, ULONG dlen, ULONG *ret) override
+    {
+        AcquireSRWLockExclusive(&lock_);
+        if (!shm_)
+            shm_ = mcam_shm_open(&map_, slot_);
+        HRESULT hr = ks_property(shm_, p, plen, d, dlen, ret);
+        ReleaseSRWLockExclusive(&lock_);
+        return hr;
+    }
     STDMETHODIMP KsMethod(PKSMETHOD, ULONG, LPVOID, ULONG, ULONG *) override { return KS_NOT_FOUND; }
     STDMETHODIMP KsEvent(PKSEVENT, ULONG, LPVOID, ULONG, ULONG *) override { return KS_NOT_FOUND; }
 
@@ -493,11 +623,17 @@ private:
             attrs_->Release();
         if (queue_)
             queue_->Release();
+        if (shm_)
+            UnmapViewOfFile(shm_);
+        if (map_)
+            CloseHandle(map_);
         InterlockedDecrement(&g_objects);
     }
 
     LONG ref_ = 1;
     SRWLOCK lock_;
+    HANDLE map_ = nullptr;
+    mcam_shm *shm_ = nullptr; /* for the picture controls */
     bool shutdown_ = false, started_ = false;
     IMFMediaEventQueue *queue_ = nullptr;
     IMFAttributes *attrs_ = nullptr;
